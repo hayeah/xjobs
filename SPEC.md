@@ -91,14 +91,34 @@ JSONL on stdin or in a file. One line per job:
   "cwd":  "/abs/or/relative/path", // optional; default = xjobs CWD
   "argv": ["./worker", "tt0133093"],
   "env":  { "FOO": "bar" },        // optional; merged onto inherited env
-  "meta": { "size": 12345678 }     // optional; free-form, lives in jobs.meta
+  "meta": { "size": 12345678 },    // optional; free-form, lives in jobs.meta
+  "nice": 10,                      // optional; setpriority(2) target for this spawn
+  "max_attempts": 3                // optional; retry ceiling for this row, default 1
 }
 ```
 
 Hard requirements: `id` is present and non-empty; `argv` is a non-empty
 list. Pumps `INSERT OR IGNORE` on `id`, so re-pumping a known id is a
-no-op (not a re-queue). To force a retry of a `failed` row, raise
-`--max-attempts` (the dedicated `retry` verb is future work).
+no-op (not a re-queue). To force a retry of a `failed` row past its
+own `max_attempts`, delete the row and re-pump it (the dedicated
+`retry` verb is future work).
+
+### Per-job knobs
+
+The mental model of `xjobs` is "launching from the current active
+shell" — process-wide CLI flags for priority and retry don't fit, so
+these are per-row instead:
+
+- **`nice`** (int, optional). When present, the runner calls
+  `setpriority(PRIO_PROCESS, pid, nice)` on the spawned child. When
+  absent, the runner makes no call and the child inherits the parent
+  process's priority. Zero is a valid explicit value (POSIX default);
+  encode "no renice" as omitting the field, not as `0`.
+- **`max_attempts`** (int, optional). The retry ceiling for this row
+  specifically. Defaults to `1` when absent (i.e. no auto-retry —
+  failure is final). The work-queue predicate compares this row's
+  `attempts` against its own `max_attempts`, so different jobs in the
+  same plan can have different retry budgets.
 
 ### Id convention: `<entity>:<phase>`
 
@@ -128,7 +148,7 @@ keep working.
 Workers begin claiming as rows land — the producer (file read or piped
 stream) can keep going while early jobs already run. After the input is
 exhausted the runner continues draining until the work-queue predicate
-matches zero rows (or `--max-attempts` is hit for every remaining
+matches zero rows (or `max_attempts` is hit for every remaining
 failure), then exits.
 
 ## The `jobs` Table
@@ -139,21 +159,23 @@ caller data goes in `meta`.
 
 ```sql
 CREATE TABLE jobs (
-    id          INTEGER PRIMARY KEY,                    -- rowid alias; insertion-order ordinal; work-queue ORDER BY
-    job_id      TEXT NOT NULL UNIQUE,                   -- user-supplied job id; INSERT OR IGNORE dedups on this
-    cwd         TEXT NOT NULL,
-    argv        TEXT NOT NULL,                          -- JSON array
-    env         TEXT NOT NULL DEFAULT '{}',             -- JSON object
-    status      TEXT NOT NULL DEFAULT 'pending',        -- pending | running | done | failed
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    pid         INTEGER,                                -- current attempt's PID
-    exit_code   INTEGER,                                -- 0 on done; non-zero on failed
-    signal      TEXT,                                   -- 'SIGKILL', 'SIGTERM', ... if killed
-    session_key TEXT,                                   -- reserved for hootty integration
-    started_at  TIMESTAMP,
-    ended_at    TIMESTAMP,
-    error       TEXT,                                   -- short message; full output in output.log
-    meta        TEXT NOT NULL DEFAULT '{}'              -- JSON; caller scratch
+    id           INTEGER PRIMARY KEY,                   -- rowid alias; insertion-order ordinal; work-queue ORDER BY
+    job_id       TEXT NOT NULL UNIQUE,                  -- user-supplied job id; INSERT OR IGNORE dedups on this
+    cwd          TEXT NOT NULL,
+    argv         TEXT NOT NULL,                         -- JSON array
+    env          TEXT NOT NULL DEFAULT '{}',            -- JSON object
+    status       TEXT NOT NULL DEFAULT 'pending',       -- pending | running | done | failed
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 1,            -- per-row retry ceiling (JSONL "max_attempts")
+    nice         INTEGER,                               -- per-row setpriority target (JSONL "nice"); NULL = inherit
+    pid          INTEGER,                               -- current attempt's PID
+    exit_code    INTEGER,                               -- 0 on done; non-zero on failed
+    signal       TEXT,                                  -- 'SIGKILL', 'SIGTERM', ... if killed
+    session_key  TEXT,                                  -- reserved for hootty integration
+    started_at   TIMESTAMP,
+    ended_at     TIMESTAMP,
+    error        TEXT,                                  -- short message; full output in output.log
+    meta         TEXT NOT NULL DEFAULT '{}'             -- JSON; caller scratch
 );
 CREATE INDEX idx_jobs_status ON jobs(status);
 ```
@@ -171,6 +193,8 @@ State-column names (`id`, `status`, `attempts`, `pid`, `exit_code`,
 reserved — the JSONL line's `id` is mapped onto the `job_id` column,
 and the other state columns cannot be used as top-level JSONL fields.
 The runner stores the caller's free-form data only in `meta`.
+`nice` and `max_attempts` are also reserved at the top level (they
+populate their respective columns directly — see "Per-job knobs").
 
 **Fresh schema only.** `ensureSchema` defines the shape above and runs
 no migrations. A pre-existing `.xjobs/db.sql3` from an earlier xjobs
@@ -180,12 +204,14 @@ build does not carry over — `rm -rf .xjobs/` and re-pump.
 
 ```sql
 WHERE status = 'pending'
-   OR (status = 'failed' AND attempts < :max_attempts)
+   OR (status = 'failed' AND attempts < max_attempts)
 ```
 
-`running` rows are **not** in the predicate. They're handled out-of-band
-by the reaper pass at drain start (next section). User `--where`
-fragments AND-combine after the built-in predicate.
+`max_attempts` is the row's own column, so different jobs in the same
+plan retry to different depths. `running` rows are **not** in the
+predicate. They're handled out-of-band by the reaper pass at drain
+start (next section). User `--where` fragments AND-combine after the
+built-in predicate.
 
 Eligible rows are drained `ORDER BY attempts, id` — primary key is
 the attempt counter (ascending), tiebreaker is the integer PK `id`
@@ -201,7 +227,7 @@ still at `attempts<N` is served first. Concretely: with three rows that
 all fail at attempt 1, retries are interleaved `A2, B2, C2, A3, B3, C3,
 …` rather than `A2, A3, …, B2, B3, …`. The point is that one
 slow-to-fix row can't starve its siblings out of the worker pool while
-it burns through `--max-attempts`. Fresh `attempts=0` rows pumped
+it burns through its own `max_attempts`. Fresh `attempts=0` rows pumped
 mid-drain also cut in front of failed-with-retries-remaining rows —
 "new work first, retries when there's slack."
 
@@ -391,13 +417,19 @@ xjobs monitor [flags] [--id ID]
 
 Flags come **after** the subcommand if you use one:
 
-| flag             | default     | meaning                                                       |
-|------------------|-------------|---------------------------------------------------------------|
-| `--state-dir`    | `.xjobs`    | dir holding `db.sql3` + per-job session dirs                  |
-| `--workers`      | `NumCPU`    | concurrent job processes                                      |
-| `--max-attempts` | `1`         | max total tries per row; `1` = no auto-retry. See "Work-queue predicate" for the round-robin retry rule. |
-| `--nice`         | `5`         | nice value applied to spawned children                        |
-| `--where`        | (none)      | SQL fragment `AND`-combined with the work-queue predicate     |
+| flag          | default  | meaning                                                   |
+|---------------|----------|-----------------------------------------------------------|
+| `--state-dir` | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
+| `--workers`   | `NumCPU` | concurrent job processes                                  |
+| `--where`     | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+
+Per-job `nice` and `max_attempts` live on the JSONL row, not on the
+CLI — see [Per-job knobs](#per-job-knobs). The runner has no
+process-wide knob for either: children inherit the parent shell's
+priority by default, and failure is final unless the row's
+`max_attempts` opts in to retries. When a row does retry, it
+round-robins across siblings — see [Work-queue predicate](#work-queue-predicate)
+for the ordering rule.
 
 ### Input precedence: file arg > piped stdin > none
 
@@ -480,10 +512,12 @@ it's a caller-side discipline.
 
 `xjobs` will re-run the same `(cwd, argv, env)` from scratch when:
 
-- The previous attempt exited non-zero and `attempts < --max-attempts`.
+- The previous attempt exited non-zero and the row's own `attempts <
+  max_attempts` (default `max_attempts=1`, i.e. failure is final unless
+  the JSONL row opts in to retries).
 - The previous attempt's runner crashed mid-flight (lock released
-  without terminal write); the reaper resets the row to `pending` on the
-  next drain.
+  without terminal write); the reaper resets the row to `pending` on
+  the next drain. The crash counts against `max_attempts`.
 
 The runner has no way to know whether the prior attempt got half-way
 through the work. It passes no breadcrumbs to the next attempt. The
@@ -575,7 +609,8 @@ us defer — is parked at
 ### Additional CLI verbs
 
 - **`xjobs retry --where '<sql>'`** — reset matched rows to `pending`
-  with `attempts=0`. Today the workaround is bumping `--max-attempts`.
+  with `attempts=0`. Today the workaround is bumping the row's
+  `max_attempts` in SQL (or deleting and re-pumping).
 - **`xjobs rm --where '<sql>'`** — delete matched rows (in terminal
   states by default).
 - **`xjobs sql '<query>'`** — ad-hoc query over `jobs` + app tables.
@@ -609,8 +644,9 @@ Currently `failed` is a single bucket — every non-zero exit and every
 signal-kill lands there. Some workloads want "retryable" vs "permanent"
 (transient network vs. auth error). Options under consideration:
 
-- Caller picks an exit-code convention and uses `--max-attempts 1` for
-  permanent classes via a separate `xjobs` run.
+- Caller picks an exit-code convention and emits per-job
+  `"max_attempts": 1` for permanent classes (or omits it — 1 is the
+  default).
 - Classification encoded in `meta.error_class` written by the child
   before exit.
 
@@ -623,8 +659,8 @@ Leaning toward the second; revisit when a real workload presses on it.
   the user supplying `--where` or `xjobs sql` is the user who owns the
   DB file. Documented, not sandboxed.
 
-- **Subcommand-flag ordering.** `xjobs resume --max-attempts 1` works;
-  `xjobs --max-attempts 1 resume` does not — the dispatcher routes by
+- **Subcommand-flag ordering.** `xjobs resume --workers 4` works;
+  `xjobs --workers 4 resume` does not — the dispatcher routes by
   `argv[0]`. Standard for subcommand CLIs.
 
 - **State dir on local FS.** SQLite WAL doesn't work over NFS, and
