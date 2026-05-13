@@ -81,6 +81,11 @@ Re-pumping the same file is safe: ids are deduped via `INSERT OR IGNORE`,
 so an already-known id is a no-op. Useful when your plan script appends
 new lines and you want to fold them in.
 
+The queue drains in **insertion order**, not in alphabetical id order —
+the order of lines in your JSONL is the order workers will claim them.
+If a plan is hand-sorted by some real-world priority (download before
+transcode before upload, etc.), that order is honored.
+
 Flags (must come **after** the subcommand if you use one):
 
 | flag             | default     | meaning                                                       |

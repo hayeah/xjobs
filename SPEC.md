@@ -139,7 +139,8 @@ caller data goes in `meta`.
 
 ```sql
 CREATE TABLE jobs (
-    id          TEXT PRIMARY KEY,
+    n           INTEGER PRIMARY KEY AUTOINCREMENT,      -- insertion-order ordinal; work-queue ORDER BY
+    id          TEXT NOT NULL UNIQUE,                   -- user-supplied job id; INSERT OR IGNORE dedups on this
     cwd         TEXT NOT NULL,
     argv        TEXT NOT NULL,                          -- JSON array
     env         TEXT NOT NULL DEFAULT '{}',             -- JSON object
@@ -157,10 +158,21 @@ CREATE TABLE jobs (
 CREATE INDEX idx_jobs_status ON jobs(status);
 ```
 
-State-column names (`status`, `attempts`, `pid`, `exit_code`, `signal`,
-`session_key`, `started_at`, `ended_at`, `error`, `meta`) are reserved —
-the JSONL line cannot use them as top-level fields. The runner stores
-the caller's free-form data only in `meta`.
+The primary key is the integer `n`, auto-assigned by SQLite at INSERT
+time. The user-supplied `id` keeps its uniqueness via `UNIQUE(id)` so
+`INSERT OR IGNORE` continues to dedup pumps; it just isn't the PK
+anymore. This is what lets the work-queue drain in JSONL insertion
+order — `ORDER BY n` is true insertion order, not the alphabetical
+order of user-supplied ids.
+
+State-column names (`n`, `status`, `attempts`, `pid`, `exit_code`,
+`signal`, `session_key`, `started_at`, `ended_at`, `error`, `meta`) are
+reserved — the JSONL line cannot use them as top-level fields. The
+runner stores the caller's free-form data only in `meta`.
+
+**Fresh schema only.** `ensureSchema` defines the shape above and runs
+no migrations. A pre-existing `.xjobs/db.sql3` from an earlier xjobs
+build does not carry over — `rm -rf .xjobs/` and re-pump.
 
 ### Work-queue predicate
 
@@ -172,6 +184,12 @@ WHERE status = 'pending'
 `running` rows are **not** in the predicate. They're handled out-of-band
 by the reaper pass at drain start (next section). User `--where`
 fragments AND-combine after the built-in predicate.
+
+Eligible rows are drained `ORDER BY n` — i.e. in JSONL insertion order.
+This matters when a hand-written plan is ordered by some real-world
+dependency (download → transcode → upload, or a deliberate priority
+hand-sort): the queue respects that order instead of imposing an
+alphabetical sort on the user-supplied ids.
 
 ### Why a single table
 
