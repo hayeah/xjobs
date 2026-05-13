@@ -228,16 +228,34 @@ out of retries they remain `failed` and stop the bare `xjobs` invocation
 from exiting `0`. To re-run them later: bump `--max-attempts` and run
 `xjobs` again (currently no `xjobs retry` verb — coming).
 
-### Stdout, stderr, and getting structured data out
+### Observing a job's output
 
-The runner captures both stdout and stderr of the child to
-`.xjobs/<id>/output.log` (truncated at each attempt). This is the
-greppable transcript — `cat`, `less`, `grep`, ad-hoc.
+Jobs commonly produce rich terminal output — TUI redraws, progress bars,
+inline `\r`-updates, ANSI colors. Tailing a line-oriented log of that
+firehose is awful: escape codes appear inline, cursor moves render as
+text, overwritten lines pile up.
 
-For structured output that downstream tools should consume, write to the
-shared SQLite DB via an app-specific table (next section). For
-human-readable progress visible mid-run, log to stderr — `tail -F
-.xjobs/<id>/output.log` from another shell.
+The intended model is **one libghostty PTY per job**, hosted by the
+[hootty](https://github.com/hayeah/hootty) library. Then:
+
+- `xjobs attach <id>` — attach the current terminal to a running job;
+  cursor positioning honored, alt-screen toggles work.
+- `xjobs log <id> --format plain` — render the current PTY screen as
+  plain text. The right thing for agents that need a one-shot snapshot
+  ("what does this job look like right now?").
+- `xjobs log <id>` — full VT replay of the recorded frame stream
+  end-to-end.
+
+For machine-readable structured output that downstream tools should
+consume, write to the shared SQLite DB via an app-specific table (see
+next section). The PTY captures what an operator would *look at*; the
+DB carries what a script would *parse*.
+
+**MVP today.** PTY integration isn't wired up yet. The current build
+captures stdout + stderr to a plain-text `.xjobs/<id>/output.log` as a
+transitional placeholder — usable for line-oriented children, useless
+for TUI children. It'll be replaced by hootty's binary `pty.hootty.log`
+frame stream when the PTY swap-in lands.
 
 ### Sharing the SQLite DB
 
@@ -267,54 +285,68 @@ your language ships with; nothing xjobs-specific.
 
 ### A complete tiny example
 
-`plan.sh`:
+`plan.py` — emit one JSONL line per job:
 
-```sh
-#!/bin/sh
-set -e
-for id in $(seq -w 1 20); do
-    printf '{"id":"demo:%s","argv":["./worker.sh","%s"]}\n' "$id" "$id"
-done
+```python
+#!/usr/bin/env python3
+import json, sys
+for n in range(1, 21):
+    job = {
+        "id":   f"demo:{n:02d}",
+        "argv": ["./worker.py", str(n)],
+    }
+    print(json.dumps(job))
 ```
 
-`worker.sh`:
+`worker.py` — parse the `XJOBS` env, do an idempotency check against an
+app-owned table, do work, write a result row, occasionally fail to
+exercise retries:
 
-```sh
-#!/bin/sh
-set -e
-N="$1"
-JOB_ID=$(printf '%s' "$XJOBS" | jq -r .job_id)
-DB=$(printf '%s'   "$XJOBS" | jq -r .db)
-ATTEMPT=$(printf '%s' "$XJOBS" | jq -r .attempt)
+```python
+#!/usr/bin/env python3
+import json, os, sqlite3, sys, time
 
-echo "starting $JOB_ID (attempt $ATTEMPT)" >&2
+env  = json.loads(os.environ["XJOBS"])
+db   = sqlite3.connect(env["db"], timeout=5)
+job  = env["job_id"]
+att  = env["attempt"]
+n    = int(sys.argv[1])
 
-# Idempotency check — bail early if a prior attempt already wrote our row.
-COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM results WHERE job_id='$JOB_ID';" 2>/dev/null || echo 0)
-if [ "$COUNT" -gt 0 ]; then
-    echo "already done; skipping" >&2
-    exit 0
-fi
+print(f"starting {job} (attempt {att})", file=sys.stderr)
+
+db.execute(
+    "CREATE TABLE IF NOT EXISTS results "
+    "(job_id TEXT PRIMARY KEY, result_n INTEGER, ts TEXT)"
+)
+
+# Idempotency check — if a prior attempt already wrote our row, exit clean.
+done = db.execute(
+    "SELECT 1 FROM results WHERE job_id = ?", (job,)
+).fetchone()
+if done:
+    print("already done; skipping", file=sys.stderr)
+    sys.exit(0)
 
 # Pretend work.
-sleep $(awk "BEGIN{print 0.1 + $N / 50}")
+time.sleep(0.1 + n / 50)
 
-# Record a result row in our own table.
-sqlite3 "$DB" <<EOF
-CREATE TABLE IF NOT EXISTS results (job_id TEXT PRIMARY KEY, result_n INTEGER, ts TEXT);
-INSERT INTO results(job_id, result_n, ts) VALUES('$JOB_ID', $N, datetime('now'));
-EOF
+with db:
+    db.execute(
+        "INSERT INTO results(job_id, result_n, ts) VALUES(?, ?, datetime('now'))",
+        (job, n),
+    )
 
-# Inject occasional failure on the first attempt to exercise retries.
-if [ "$N" = "07" ] && [ "$ATTEMPT" = "1" ]; then
-    echo "synthetic fail" >&2
-    exit 7
-fi
+# Inject failure on the first attempt of one job to exercise the retry path.
+if n == 7 and att == 1:
+    print("synthetic fail", file=sys.stderr)
+    sys.exit(7)
 ```
 
+Run it:
+
 ```sh
-chmod +x plan.sh worker.sh
-./plan.sh | xjobs --workers 4
+chmod +x plan.py worker.py
+./plan.py | xjobs --workers 4
 sqlite3 .xjobs/db.sql3 'SELECT COUNT(*), AVG(result_n) FROM results;'
 ```
 
@@ -327,11 +359,16 @@ sqlite3 .xjobs/db.sql3 'SELECT COUNT(*), AVG(result_n) FROM results;'
 ├── db.sql3-shm
 └── <job-id>/            # one dir per attempted job
     ├── lock             # exclusive flock held for the child's lifetime
-    └── output.log       # stdout + stderr of the most recent attempt
+    └── pty.hootty.log   # binary frame stream of the child's terminal output
+                         #   (libghostty PTY; see "Observing a job's output")
 ```
 
 Default state dir is `./.xjobs/`. Override with `--state-dir <path>`.
 Multiple state dirs in different CWDs are independent queues.
+
+**MVP today**: PTY integration is deferred, so the current build writes
+a plain-text `<job-id>/output.log` (stdout + stderr captured via pipes)
+instead of `pty.hootty.log`. Same `lock` file, same role.
 
 `<job-id>/lock` is the liveness signal: while a runner is hosting the
 child, the flock is held; if the runner dies, the OS releases it. On the

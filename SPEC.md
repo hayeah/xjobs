@@ -60,13 +60,20 @@ views.
 ├── db.sql3-shm
 └── <job-id>/
     ├── lock             # exclusive flock held for the child's lifetime
-    └── output.log       # captured stdout + stderr of the most recent attempt
+    └── pty.hootty.log   # binary frame stream of the child's terminal output
+                         #   (libghostty PTY recording — see "Observing a job's output")
 ```
 
 Default state dir is `./.xjobs/` (CWD-relative). Override with
 `--state-dir <path>`. Two state dirs in different CWDs are independent
 queues — the natural extension of "every directory is its own scratch
 workspace."
+
+**MVP transitional.** The current build does not yet record a libghostty
+PTY. Instead it captures the child's stdout + stderr through pipes into
+a plain-text `<job-id>/output.log`. Same `lock` file, same role; the
+log file's name and content change when the PTY swap lands (see
+[Future Work](#libghostty-pty-per-job)).
 
 **Local FS only.** SQLite WAL doesn't work over NFS, and flock semantics
 across boundaries are fragile. Don't.
@@ -301,6 +308,60 @@ xjobs monitor --id ID          # filter to one job's events
 The `monitor` verb tails the events table via `SELECT ... WHERE seq >
 :since ORDER BY seq LIMIT 1` in a 200ms poll loop. Returns after one
 event. Agents loop on it to wait for "the next interesting thing."
+
+## Observing a Job's Output
+
+Events describe **state transitions**. This section is about the
+orthogonal question: what's happening *inside* a running job, right now?
+
+Job processes commonly produce rich terminal output — TUI redraws,
+progress bars, inline `\r`-updates, ANSI colors. A line-oriented log of
+that firehose is unreadable: escape codes inline, cursor moves rendered
+as text, overwritten lines piling up. A claude/codex run, a `cargo
+build`, an `apt` installer, a `huggingface-cli` download — all of these
+look like garbage in a flat append-only log.
+
+The answer is **one libghostty PTY per job**, hosted by the
+[hootty](https://github.com/hayeah/hootty) library. The PTY parses the
+child's byte stream through a real VT emulator, so:
+
+- The current "screen" is always recoverable — what an operator would
+  see if they looked at the terminal *now*.
+- A binary frame stream (`pty.hootty.log`) is persisted to disk for
+  later replay.
+- Live attach is a real attach (cursor placement, alt-screen, kitty
+  keyboard) — not a tail of bytes.
+
+Three operator/agent affordances ride on this:
+
+| verb                                    | purpose                                                                |
+|-----------------------------------------|------------------------------------------------------------------------|
+| `xjobs attach <id>`                     | attach the current terminal to the live job                            |
+| `xjobs log <id> --format plain`         | one-shot snapshot of the current screen as plain text                  |
+| `xjobs log <id>`                        | full VT replay of the recorded frame stream                            |
+
+These are thin pass-throughs to `hoot --state-dir .xjobs`. The state dir
+is intentionally hootty-compatible, so `hoot list/attach/log/kill/write
+--state-dir .xjobs` work as native verbs against an xjobs queue.
+
+There is **no per-job stdout/stderr log**. The PTY frame stream is the
+canonical capture; rendering it through libghostty is what makes the
+output actually inspectable. For machine-readable structured output that
+downstream tools should consume, write to the shared SQLite DB via an
+app-specific table (see [App-Specific Tables](#app-specific-tables)).
+The PTY captures what you'd *look at*; the DB carries what you'd
+*parse*.
+
+### MVP today
+
+PTY integration isn't wired up yet — the runner spawns children through
+plain pipes and captures stdout + stderr to a transitional
+`<id>/output.log`. This works for line-oriented children and is awful
+for TUI children, exactly as the framing above predicts. The replacement
+is a Service-seam swap (see
+[libghostty PTY per job](#libghostty-pty-per-job) under Future Work);
+the spec above describes the intended shape, not what's in the build
+today.
 
 ## CLI Surface
 
