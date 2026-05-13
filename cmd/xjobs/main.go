@@ -105,30 +105,21 @@ func cmdRun(argv []string) error {
 	ctx, cancel := signalCtx()
 	defer cancel()
 
-	pumpDone := make(chan struct{})
-	pumpErrC := make(chan error, 1)
-
 	src, srcName, srcOpen, err := openPumpSource(rest)
 	if err != nil {
 		return err
 	}
-	if !srcOpen {
-		close(pumpDone) // nothing to pump; skip straight to drain
-		pumpErrC <- nil
-	} else {
+
+	pumpDone := make(chan struct{})
+	pumpErrC := make(chan error, 1)
+	if srcOpen {
 		go func() {
 			defer close(pumpDone)
-			ins, skip, total, err := rn.Pump(ctx, src)
-			if c, ok := src.(io.Closer); ok {
-				_ = c.Close()
-			}
-			if err != nil {
-				pumpErrC <- fmt.Errorf("pump %s: %w", srcName, err)
-				return
-			}
-			fmt.Fprintf(os.Stderr, "xjobs: pumped %d / skipped %d / total %d from %s\n", ins, skip, total, srcName)
-			pumpErrC <- nil
+			pumpErrC <- runPump(ctx, rn, src, srcName)
 		}()
+	} else {
+		close(pumpDone)
+		pumpErrC <- nil
 	}
 
 	drainErr := rn.Drain(ctx, c.opts(), pumpDone, os.Stdout)
@@ -140,6 +131,18 @@ func cmdRun(argv []string) error {
 		return drainErr
 	}
 	return pumpErr
+}
+
+func runPump(ctx context.Context, rn *runner.Runner, src io.Reader, name string) error {
+	ins, skip, total, err := rn.Pump(ctx, src)
+	if c, ok := src.(io.Closer); ok {
+		_ = c.Close()
+	}
+	if err != nil {
+		return fmt.Errorf("pump %s: %w", name, err)
+	}
+	fmt.Fprintf(os.Stderr, "xjobs: pumped %d / skipped %d / total %d from %s\n", ins, skip, total, name)
+	return nil
 }
 
 func cmdResume(argv []string) error {

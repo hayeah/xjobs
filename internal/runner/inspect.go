@@ -202,15 +202,7 @@ func (rn *Runner) lastEvent(ctx context.Context, idFilter string) (eventRow, boo
 		args = append(args, idFilter)
 	}
 	q += ` ORDER BY e.id DESC LIMIT 1`
-	var r eventRow
-	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.ID, &r.Data)
-	if err == sql.ErrNoRows {
-		return r, false, nil
-	}
-	if err != nil {
-		return r, false, err
-	}
-	return r, true, nil
+	return rn.scanOneEvent(ctx, q, args...)
 }
 
 func (rn *Runner) nextEvent(ctx context.Context, idFilter string, since int64) (eventRow, bool, error) {
@@ -224,6 +216,10 @@ func (rn *Runner) nextEvent(ctx context.Context, idFilter string, since int64) (
 		args = append(args, since)
 	}
 	q += ` ORDER BY e.id ASC LIMIT 1`
+	return rn.scanOneEvent(ctx, q, args...)
+}
+
+func (rn *Runner) scanOneEvent(ctx context.Context, q string, args ...any) (eventRow, bool, error) {
 	var r eventRow
 	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.ID, &r.Data)
 	if err == sql.ErrNoRows {

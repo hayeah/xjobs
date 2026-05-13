@@ -146,13 +146,8 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 		}()
 	}
 
-	idleSignal := pumpDone
-	if idleSignal == nil {
-		closed := make(chan struct{})
-		close(closed)
-		idleSignal = closed
-	}
-	feedErr := rn.feedQueue(ctx, opts, queue, idleSignal, &inflight)
+	// feedQueue treats a nil pumpDone as "already done" via isClosed.
+	feedErr := rn.feedQueue(ctx, opts, queue, pumpDone, &inflight)
 	close(queue)
 	wg.Wait()
 
@@ -223,23 +218,20 @@ func (rn *Runner) runOne(ctx context.Context, row jobRow, sink *eventSink) error
 		defer cancel()
 	}
 
+	exitCode := sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}
+	var termErr error
 	switch {
 	case res.Err != nil:
-		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{}, "", res.Err.Error()); termErr != nil {
-			return termErr
-		}
+		termErr = rn.terminalFail(finalCtx, row.ID, sql.NullInt64{}, "", res.Err.Error())
 	case res.Signal != "":
-		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, res.Signal, "killed by "+res.Signal); termErr != nil {
-			return termErr
-		}
+		termErr = rn.terminalFail(finalCtx, row.ID, exitCode, res.Signal, "killed by "+res.Signal)
 	case res.ExitCode == 0:
-		if termErr := rn.terminalOK(finalCtx, row.ID, 0); termErr != nil {
-			return termErr
-		}
+		termErr = rn.terminalOK(finalCtx, row.ID, 0)
 	default:
-		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, "", fmt.Sprintf("exit %d", res.ExitCode)); termErr != nil {
-			return termErr
-		}
+		termErr = rn.terminalFail(finalCtx, row.ID, exitCode, "", fmt.Sprintf("exit %d", res.ExitCode))
+	}
+	if termErr != nil {
+		return termErr
 	}
 
 	return sink.emit(finalCtx, eventFromResult(row.ID, attempt, dur, res))
