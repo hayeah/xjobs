@@ -81,12 +81,6 @@ Re-pumping the same file is safe: ids are deduped via `INSERT OR IGNORE`,
 so an already-known id is a no-op. Useful when your plan script appends
 new lines and you want to fold them in.
 
-Workers drain in **insertion order** — the order rows landed in the
-SQLite queue, which is the order of the JSONL plan. Pump assigns each
-new row a monotonic `seq` and the work-queue selects `ORDER BY seq`.
-Pre-`seq` `.xjobs/db.sql3` files from older xjobs builds are migrated
-in-place on open (one ALTER + `seq = rowid` backfill).
-
 Flags (must come **after** the subcommand if you use one):
 
 | flag             | default     | meaning                                                       |
