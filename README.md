@@ -92,7 +92,7 @@ Flags (must come **after** the subcommand if you use one):
 |------------------|-------------|---------------------------------------------------------------|
 | `--state-dir`    | `.xjobs`    | dir holding `db.sql3` + per-job session dirs                  |
 | `--workers`      | `NumCPU`    | concurrent job processes                                      |
-| `--max-attempts` | `3`         | retry ceiling for failed rows                                 |
+| `--max-attempts` | `1`         | max total tries per row; `1` = no auto-retry. Retries round-robin across siblings (a failing row yields the worker to other ready rows before its next try). |
 | `--nice`         | `5`         | nice value applied to spawned children                        |
 | `--where`        | (none)      | SQL fragment `AND`-combined with the work-queue predicate     |
 

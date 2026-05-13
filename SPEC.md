@@ -187,11 +187,23 @@ WHERE status = 'pending'
 by the reaper pass at drain start (next section). User `--where`
 fragments AND-combine after the built-in predicate.
 
-Eligible rows are drained `ORDER BY id` — i.e. in JSONL insertion order.
-This matters when a hand-written plan is ordered by some real-world
-dependency (download → transcode → upload, or a deliberate priority
-hand-sort): the queue respects that order instead of imposing an
-alphabetical sort on the user-supplied ids.
+Eligible rows are drained `ORDER BY attempts, id` — primary key is
+the attempt counter (ascending), tiebreaker is the integer PK `id`
+(insertion order). The id-tiebreaker preserves the JSONL-insertion-order
+guarantee for fresh work: when every eligible row is at `attempts=0`,
+the order is exactly `ORDER BY id`. This matters when a hand-written
+plan is ordered by some real-world dependency (download → transcode →
+upload, or a deliberate priority hand-sort).
+
+The `attempts` term makes retries round-robin across siblings. A row
+that failed at attempt `N` carries `attempts=N` in the DB; any sibling
+still at `attempts<N` is served first. Concretely: with three rows that
+all fail at attempt 1, retries are interleaved `A2, B2, C2, A3, B3, C3,
+…` rather than `A2, A3, …, B2, B3, …`. The point is that one
+slow-to-fix row can't starve its siblings out of the worker pool while
+it burns through `--max-attempts`. Fresh `attempts=0` rows pumped
+mid-drain also cut in front of failed-with-retries-remaining rows —
+"new work first, retries when there's slack."
 
 ### Why a single table
 
@@ -383,7 +395,7 @@ Flags come **after** the subcommand if you use one:
 |------------------|-------------|---------------------------------------------------------------|
 | `--state-dir`    | `.xjobs`    | dir holding `db.sql3` + per-job session dirs                  |
 | `--workers`      | `NumCPU`    | concurrent job processes                                      |
-| `--max-attempts` | `3`         | retry ceiling for failed rows                                 |
+| `--max-attempts` | `1`         | max total tries per row; `1` = no auto-retry. See "Work-queue predicate" for the round-robin retry rule. |
 | `--nice`         | `5`         | nice value applied to spawned children                        |
 | `--where`        | (none)      | SQL fragment `AND`-combined with the work-queue predicate     |
 
