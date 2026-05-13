@@ -47,9 +47,10 @@ What goes wrong without a convention:
   queue.
 
 Compound benefit: the same `.xjobs/` directory is, simultaneously, a job
-queue (SQLite), a fleet of per-job log files, and (future) a set of
-attachable terminal sessions via hootty/libghostty. One state dir, all
-views.
+queue (SQLite) and a fleet of per-job log files. One state dir, all
+views. (A future libghostty/hootty integration would extend the same
+directory into a set of attachable terminal sessions — parked at
+[`docs/future/hootty-integration.md`](docs/future/hootty-integration.md).)
 
 ## State Layout
 
@@ -60,8 +61,7 @@ views.
 ├── db.sql3-shm
 └── <job-id>/
     ├── lock             # exclusive flock held for the child's lifetime
-    └── pty.hootty.log   # binary frame stream of the child's terminal output
-                         #   (libghostty PTY recording — see "Observing a job's output")
+    └── output.log       # captured stdout + stderr from the child
 ```
 
 Default state dir is `./.xjobs/` (CWD-relative). Override with
@@ -69,17 +69,14 @@ Default state dir is `./.xjobs/` (CWD-relative). Override with
 queues — the natural extension of "every directory is its own scratch
 workspace."
 
-**MVP transitional.** The PTY capture / replay / attach affordances all
-already exist in the hootty library — `pty.hootty.log` is hootty's
-binary recording format, and `hoot log --format plain` / `hoot attach`
-are working CLI verbs against any hootty state dir. xjobs just doesn't
-import hootty yet, because the libghostty cgo dependency (Zig + CMake +
-pkg-config) is a meaningful build-prereq increase that the first cut
-deferred. The current build spawns children through plain `os.exec`
-pipes and captures stdout + stderr to a placeholder
-`<job-id>/output.log`. Swapping to a hootty session per job is a
-self-contained replacement of `execAttempt` in
-`internal/runner/service.go` and lands the entire PTY story at once.
+Each child is spawned through plain `os.exec` pipes; its combined
+stdout + stderr is written to `<job-id>/output.log`. This is enough for
+line-oriented children but degrades on TUI children (escape codes pile
+up as raw bytes). A deferred libghostty PTY integration would replace
+`output.log` with a binary frame stream (`pty.hootty.log`) plus live
+attach / replay verbs — see
+[`docs/future/hootty-integration.md`](docs/future/hootty-integration.md).
+The swap point is `execAttempt` in `internal/runner/service.go`.
 
 **Local FS only.** SQLite WAL doesn't work over NFS, and flock semantics
 across boundaries are fragile. Don't.
@@ -320,52 +317,34 @@ event. Agents loop on it to wait for "the next interesting thing."
 Events describe **state transitions**. This section is about the
 orthogonal question: what's happening *inside* a running job, right now?
 
-Job processes commonly produce rich terminal output — TUI redraws,
-progress bars, inline `\r`-updates, ANSI colors. A line-oriented log of
-that firehose is unreadable: escape codes inline, cursor moves rendered
-as text, overwritten lines piling up. A claude/codex run, a `cargo
-build`, an `apt` installer, a `huggingface-cli` download — all of these
-look like garbage in a flat append-only log.
+Today the answer is "tail the log file." Each child is spawned through
+plain pipes and its combined stdout + stderr is written to
+`.xjobs/<id>/output.log`:
 
-The answer is **one libghostty PTY per job**, hosted by the
-[hootty](https://github.com/hayeah/hootty) library. The PTY parses the
-child's byte stream through a real VT emulator, so:
+```sh
+tail -f .xjobs/tt0133093:download/output.log
+```
 
-- The current "screen" is always recoverable — what an operator would
-  see if they looked at the terminal *now*.
-- A binary frame stream (`pty.hootty.log`) is persisted to disk for
-  later replay.
-- Live attach is a real attach (cursor placement, alt-screen, kitty
-  keyboard) — not a tail of bytes.
+This is enough for line-oriented children (downloaders that print one
+URL per line, build tools that print one rule per line, scrapers, etc).
 
-Three operator/agent affordances ride on this:
+It is **not** enough for TUI children — claude/codex runs, `cargo
+build`'s progress UI, `apt` installers, `huggingface-cli` downloads.
+Their output is a stream of ANSI escapes, `\r` overwrites, cursor
+moves, and alt-screen toggles; a flat append-only log captures it as
+unreadable bytes. For those workloads:
 
-| verb                                    | purpose                                                                |
-|-----------------------------------------|------------------------------------------------------------------------|
-| `xjobs attach <id>`                     | attach the current terminal to the live job                            |
-| `xjobs log <id> --format plain`         | one-shot snapshot of the current screen as plain text                  |
-| `xjobs log <id>`                        | full VT replay of the recorded frame stream                            |
+- Have the child write structured progress / results to the shared
+  SQLite DB via an app-specific table (see
+  [App-Specific Tables](#app-specific-tables)). The DB carries what a
+  script would *parse*.
+- Or wait for the deferred libghostty PTY integration, which adds a
+  proper VT-emulator capture per job plus live attach and replay
+  verbs. Full design parked at
+  [`docs/future/hootty-integration.md`](docs/future/hootty-integration.md).
 
-These are thin pass-throughs to `hoot --state-dir .xjobs`. The state dir
-is intentionally hootty-compatible, so `hoot list/attach/log/kill/write
---state-dir .xjobs` work as native verbs against an xjobs queue.
-
-There is **no per-job stdout/stderr log**. The PTY frame stream is the
-canonical capture; rendering it through libghostty is what makes the
-output actually inspectable. For machine-readable structured output that
-downstream tools should consume, write to the shared SQLite DB via an
-app-specific table (see [App-Specific Tables](#app-specific-tables)).
-The PTY captures what you'd *look at*; the DB carries what you'd
-*parse*.
-
-### MVP today
-
-xjobs doesn't import the hootty library yet, so none of the PTY
-affordances above work in the current build. The runner spawns children
-through plain pipes and captures stdout + stderr to a placeholder
-`<id>/output.log`. The PTY capabilities themselves are not future work
-— they already exist in hootty; xjobs just needs to wire them in. See
-[Future Work → libghostty PTY per job](#libghostty-pty-per-job).
+There are no `xjobs attach` / `xjobs log` verbs today; they'd land
+alongside the PTY integration as pass-throughs to hootty.
 
 ## CLI Surface
 
@@ -545,30 +524,19 @@ A double SIGINT is the same as a single one (already KILL).
 
 Items the design spec covers but the current MVP does not implement.
 
-### libghostty PTY per job
+### libghostty PTY per job (plus attach / log / kill / write verbs)
 
-The biggest deferred capability. Today, child output is captured to
-`<id>/output.log` via plain pipes. Future: each job spawns on a
+The biggest deferred capability. Each job would spawn on a
 libghostty-backed PTY using the [hootty](https://github.com/hayeah/hootty)
-library, so:
-
-- The state dir doubles as a hootty session dir, making
-  `hoot attach --state-dir .xjobs <job-id>` work for live observation.
-- `hoot log --state-dir .xjobs <job-id>` replays the full recorded
-  terminal stream (cursor moves, ANSI escapes, alt-screen).
-- TUI children (installers that draw progress bars, agentic runs) render
-  correctly and stay observable.
-
-The `execAttempt` function in `internal/runner/service.go` is the swap
-point — same signature, different implementation. Per-job flock moves
-from `.xjobs/<id>/lock` to hootty's session-dir flock; reaper logic
-stays identical.
+library, with `xjobs attach` / `xjobs log` / `xjobs kill` / `xjobs
+write` riding on top as pass-throughs to `hoot`. The full design — why
+a PTY, the verb table, state-layout under the integration, the
+`execAttempt` swap, and the libghostty cgo build-prereq cost that made
+us defer — is parked at
+[`docs/future/hootty-integration.md`](docs/future/hootty-integration.md).
 
 ### Additional CLI verbs
 
-- **`xjobs attach <id>`**, **`xjobs log <id>`**, **`xjobs kill <id>`**,
-  **`xjobs write <id> "..."`** — pass-throughs to `hoot` against the
-  shared state dir. Land alongside hootty integration.
 - **`xjobs retry --where '<sql>'`** — reset matched rows to `pending`
   with `attempts=0`. Today the workaround is bumping `--max-attempts`.
 - **`xjobs rm --where '<sql>'`** — delete matched rows (in terminal
@@ -622,6 +590,6 @@ Leaning toward the second; revisit when a real workload presses on it.
   `xjobs --max-attempts 1 resume` does not — the dispatcher routes by
   `argv[0]`. Standard for subcommand CLIs.
 
-- **State dir on local FS.** SQLite WAL doesn't work over NFS; hootty
-  flock semantics are also fragile across boundaries. Don't put
+- **State dir on local FS.** SQLite WAL doesn't work over NFS, and
+  flock semantics are fragile across network boundaries. Don't put
   `.xjobs/` on a network share.
