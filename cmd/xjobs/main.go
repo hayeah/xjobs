@@ -33,8 +33,6 @@ func run(argv []string) error {
 			return cmdLS(argv[1:])
 		case "monitor":
 			return cmdMonitor(argv[1:])
-		case "resume":
-			return cmdResume(argv[1:])
 		case "run":
 			return cmdRun(argv[1:])
 		case "-h", "--help", "help":
@@ -49,39 +47,37 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `xjobs — parallel job runner backed by SQLite.
 
 usage:
-  xjobs [flags] [<file.jsonl> | -]   pump (file > stdin > none) + drain
-  xjobs run     [flags] [<file.jsonl>]   same as bare
-  xjobs resume  [flags]                  drain only; ignore any stdin
+  xjobs [flags] [<file.jsonl> | -]       pump + drain (alias for `+"`"+`run`+"`"+`)
+  xjobs run     [flags] [<file.jsonl>]
   xjobs ls      [flags] [--json] [--where SQL]
   xjobs monitor [flags] [--id ID]
 
-flags:
-  --state-dir <path>     default .xjobs
-  --workers N            default NumCPU
-  --where '<sql>'        AND-combined with the work-queue predicate
+With no input source, run/bare drains the queue and exits — the
+former `+"`"+`xjobs resume`+"`"+` behavior. Pipe `+"`"+`< /dev/null`+"`"+` to force
+drain-only when stdin is already piped.
+
+Run `+"`"+`xjobs <command> -h`+"`"+` for command-specific flags.
 
 input:
   JSONL lines: {"id":"…", "cwd":"…", "argv":["…"], "env":{}, "meta":{}, "nice":N, "max_attempts":N}
-  Duplicate ids are silently skipped (INSERT OR IGNORE).
-  Children inherit the parent process's priority by default; set per-job "nice" to renice.
-  "max_attempts" defaults to 1 (no auto-retry) when absent.`)
+  Duplicate ids are silently skipped (INSERT OR IGNORE).`)
 }
 
-type commonFlags struct {
+type drainFlags struct {
 	StateDir string
 	Workers  int
 	Where    string
 }
 
-func bindCommon(fs *flag.FlagSet) *commonFlags {
-	c := &commonFlags{}
+func bindDrainFlags(fs *flag.FlagSet) *drainFlags {
+	c := &drainFlags{}
 	fs.StringVar(&c.StateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 	fs.IntVar(&c.Workers, "workers", 0, "concurrent job processes (default: NumCPU)")
 	fs.StringVar(&c.Where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	return c
 }
 
-func (c *commonFlags) opts() runner.Options {
+func (c *drainFlags) opts() runner.Options {
 	return runner.Options{
 		StateDir: c.StateDir,
 		Workers:  c.Workers,
@@ -91,7 +87,7 @@ func (c *commonFlags) opts() runner.Options {
 
 func cmdRun(argv []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	c := bindCommon(fs)
+	c := bindDrainFlags(fs)
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -145,41 +141,24 @@ func runPump(ctx context.Context, rn *runner.Runner, src io.Reader, name string)
 	return nil
 }
 
-func cmdResume(argv []string) error {
-	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
-	c := bindCommon(fs)
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-	if len(fs.Args()) > 0 {
-		return fmt.Errorf("resume: unexpected positional args %v", fs.Args())
-	}
-	rn, err := runner.Open(c.StateDir)
-	if err != nil {
-		return err
-	}
-	defer rn.Close()
-	ctx, cancel := signalCtx()
-	defer cancel()
-	return rn.Drain(ctx, c.opts(), nil, os.Stdout)
-}
-
 func cmdLS(argv []string) error {
 	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
-	c := bindCommon(fs)
+	var stateDir, where string
 	var jsonOut bool
+	fs.StringVar(&stateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
+	fs.StringVar(&where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	fs.BoolVar(&jsonOut, "json", false, "emit JSONL rows instead of text")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	rn, err := runner.Open(c.StateDir)
+	rn, err := runner.Open(stateDir)
 	if err != nil {
 		return err
 	}
 	defer rn.Close()
 	ctx, cancel := signalCtx()
 	defer cancel()
-	rows, err := rn.LS(ctx, c.Where)
+	rows, err := rn.LS(ctx, where)
 	if err != nil {
 		return err
 	}
@@ -192,13 +171,13 @@ func cmdLS(argv []string) error {
 
 func cmdMonitor(argv []string) error {
 	fs := flag.NewFlagSet("monitor", flag.ContinueOnError)
-	c := bindCommon(fs)
-	var id string
+	var stateDir, id string
+	fs.StringVar(&stateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 	fs.StringVar(&id, "id", "", "filter to a single job id")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	rn, err := runner.Open(c.StateDir)
+	rn, err := runner.Open(stateDir)
 	if err != nil {
 		return err
 	}
