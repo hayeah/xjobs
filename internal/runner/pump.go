@@ -14,7 +14,8 @@ import (
 // (already present from a prior pump).
 func (rn *Runner) Pump(ctx context.Context, r io.Reader) (inserted, skipped, total int, err error) {
 	stmt, err := rn.db.PrepareContext(ctx,
-		`INSERT OR IGNORE INTO jobs(id, cwd, argv, env, meta) VALUES(?, ?, ?, ?, ?)`)
+		`INSERT OR IGNORE INTO jobs(id, cwd, argv, env, meta, seq)
+		 VALUES(?, ?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM jobs))`)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("prepare insert: %w", err)
 	}
