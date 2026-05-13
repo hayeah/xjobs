@@ -24,8 +24,8 @@ func openDB(path string) (*sql.DB, error) {
 func ensureSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
-			n           INTEGER PRIMARY KEY AUTOINCREMENT,
-			id          TEXT NOT NULL UNIQUE,
+			id          INTEGER PRIMARY KEY,
+			job_id      TEXT NOT NULL UNIQUE,
 			cwd         TEXT NOT NULL,
 			argv        TEXT NOT NULL,
 			env         TEXT NOT NULL DEFAULT '{}',
@@ -42,9 +42,9 @@ func ensureSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`,
 		`CREATE TABLE IF NOT EXISTS events (
-			seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+			id       INTEGER PRIMARY KEY,
 			ts       TIMESTAMP NOT NULL,
-			job_id   TEXT NOT NULL,
+			job_id   INTEGER NOT NULL REFERENCES jobs(id),
 			attempt  INTEGER NOT NULL,
 			kind     TEXT NOT NULL,
 			data     TEXT NOT NULL DEFAULT '{}'
