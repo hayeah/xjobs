@@ -24,7 +24,8 @@ func openDB(path string) (*sql.DB, error) {
 func ensureSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
-			id          TEXT PRIMARY KEY,
+			n           INTEGER PRIMARY KEY AUTOINCREMENT,
+			id          TEXT NOT NULL UNIQUE,
 			cwd         TEXT NOT NULL,
 			argv        TEXT NOT NULL,
 			env         TEXT NOT NULL DEFAULT '{}',
