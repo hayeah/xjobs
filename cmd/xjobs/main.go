@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/hayeah/xjobs/internal/runner"
@@ -107,6 +106,7 @@ func cmdRun(argv []string) error {
 	defer cancel()
 
 	pumpDone := make(chan struct{})
+	pumpErrC := make(chan error, 1)
 
 	src, srcName, srcOpen, err := openPumpSource(rest)
 	if err != nil {
@@ -114,6 +114,7 @@ func cmdRun(argv []string) error {
 	}
 	if !srcOpen {
 		close(pumpDone) // nothing to pump; skip straight to drain
+		pumpErrC <- nil
 	} else {
 		go func() {
 			defer close(pumpDone)
@@ -122,14 +123,23 @@ func cmdRun(argv []string) error {
 				_ = c.Close()
 			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "xjobs: pump %s: %v\n", srcName, err)
+				pumpErrC <- fmt.Errorf("pump %s: %w", srcName, err)
 				return
 			}
 			fmt.Fprintf(os.Stderr, "xjobs: pumped %d / skipped %d / total %d from %s\n", ins, skip, total, srcName)
+			pumpErrC <- nil
 		}()
 	}
 
-	return rn.Drain(ctx, c.opts(), pumpDone, os.Stdout)
+	drainErr := rn.Drain(ctx, c.opts(), pumpDone, os.Stdout)
+	pumpErr := <-pumpErrC
+	if pumpErr != nil && !errors.Is(pumpErr, context.Canceled) {
+		return pumpErr
+	}
+	if drainErr != nil {
+		return drainErr
+	}
+	return pumpErr
 }
 
 func cmdResume(argv []string) error {
@@ -164,7 +174,9 @@ func cmdLS(argv []string) error {
 		return err
 	}
 	defer rn.Close()
-	rows, err := rn.LS(context.Background(), c.Where)
+	ctx, cancel := signalCtx()
+	defer cancel()
+	rows, err := rn.LS(ctx, c.Where)
 	if err != nil {
 		return err
 	}
@@ -226,6 +238,3 @@ func signalCtx() (context.Context, context.CancelFunc) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	return ctx, cancel
 }
-
-// init to keep the strings import alive if we trim flags later.
-var _ = strings.TrimSpace

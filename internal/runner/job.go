@@ -3,6 +3,8 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 // Job is the JSONL line shape pumped into xjobs.
@@ -21,11 +23,32 @@ type Job struct {
 }
 
 func (j *Job) validate() error {
-	if j.ID == "" {
-		return fmt.Errorf("missing id")
+	if err := validateJobID(j.ID); err != nil {
+		return err
 	}
 	if len(j.Argv) == 0 {
 		return fmt.Errorf("missing or empty argv (id=%q)", j.ID)
+	}
+	return nil
+}
+
+func validateJobID(id string) error {
+	if id == "" {
+		return fmt.Errorf("missing id")
+	}
+	if id == "." || id == ".." {
+		return fmt.Errorf("invalid id %q: must not be . or ..", id)
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return fmt.Errorf("invalid id %q: must not contain path separators", id)
+	}
+	if strings.ContainsRune(id, 0) {
+		return fmt.Errorf("invalid id %q: must not contain NUL", id)
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("invalid id %q: must not contain control characters", id)
+		}
 	}
 	return nil
 }

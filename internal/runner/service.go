@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,7 +38,10 @@ type runResult struct {
 // child is alive, released on this function's return (success, failure,
 // or panic via defer).
 func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string, onSpawn func(pid int)) runResult {
-	jobDir := filepath.Join(stateDir, row.ID)
+	jobDir, err := jobDirPath(stateDir, row.ID)
+	if err != nil {
+		return runResult{Err: err}
+	}
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return runResult{Err: fmt.Errorf("mkdir %s: %w", jobDir, err)}
 	}
@@ -54,11 +58,14 @@ func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string
 	defer lock.Close()
 
 	logPath := filepath.Join(jobDir, "output.log")
-	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		return runResult{Err: fmt.Errorf("open log %s: %w", logPath, err)}
 	}
 	defer logFile.Close()
+	if err := writeAttemptSeparator(logFile, row.Attempt); err != nil {
+		return runResult{Err: fmt.Errorf("write log separator %s: %w", logPath, err)}
+	}
 
 	xjobsEnv := xjobsEnvJSON(dbPath, stateDir, row.ID, row.Attempt)
 
@@ -71,6 +78,18 @@ func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string
 	// Run in its own process group so we can deliver signals to the whole
 	// tree on shutdown.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
 
 	if err := cmd.Start(); err != nil {
 		return runResult{Err: fmt.Errorf("start: %w", err)}
@@ -111,6 +130,22 @@ func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string
 	}
 	res.Err = waitErr
 	return res
+}
+
+func jobDirPath(stateDir, id string) (string, error) {
+	if err := validateJobID(id); err != nil {
+		return "", err
+	}
+	return filepath.Join(stateDir, id), nil
+}
+
+func writeAttemptSeparator(f *os.File, attempt int) error {
+	prefix := ""
+	if st, err := f.Stat(); err == nil && st.Size() > 0 {
+		prefix = "\n"
+	}
+	_, err := fmt.Fprintf(f, "%s--- attempt %d at %s ---\n", prefix, attempt, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func xjobsEnvJSON(dbPath, stateDir, jobID string, attempt int) string {

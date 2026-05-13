@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 )
 
 // jobRow is the subset of the jobs row needed to spawn an attempt.
@@ -25,10 +26,10 @@ type jobRow struct {
 // attempt has terminal-written and either succeeded or re-queued as
 // failed-with-retries-remaining).
 //
-// Exit condition: pumpDone is closed AND no work-queue rows AND no
-// running rows. While `running > 0` we wait — those workers may terminal
-// to 'failed' with retries remaining and re-queue.
-func (rn *Runner) feedQueue(ctx context.Context, opts Options, queue chan<- jobRow, pumpDone <-chan struct{}) error {
+// Exit condition: pumpDone is closed AND no work-queue rows AND no local
+// in-flight rows. While local work is in flight we wait — those workers may
+// terminal to 'failed' with retries remaining and re-queue.
+func (rn *Runner) feedQueue(ctx context.Context, opts Options, queue chan<- jobRow, pumpDone <-chan struct{}, inflight *atomic.Int64) error {
 	seen := map[string]int64{}
 	for {
 		batch, err := rn.fetchBatch(ctx, opts, seen)
@@ -36,10 +37,8 @@ func (rn *Runner) feedQueue(ctx context.Context, opts Options, queue chan<- jobR
 			return err
 		}
 		for _, row := range batch {
-			select {
-			case queue <- row:
-			case <-ctx.Done():
-				return ctx.Err()
+			if err := enqueueJob(ctx, queue, inflight, row); err != nil {
+				return err
 			}
 		}
 		if len(batch) > 0 {
@@ -59,11 +58,7 @@ func (rn *Runner) feedQueue(ctx context.Context, opts Options, queue chan<- jobR
 		if !isClosed(pumpDone) {
 			continue
 		}
-		running, err := rn.runningCount(ctx)
-		if err != nil {
-			return err
-		}
-		if running > 0 {
+		if inflight.Load() > 0 {
 			continue
 		}
 		// Final confirmation scan — picks up rows that just terminal-wrote
@@ -76,12 +71,21 @@ func (rn *Runner) feedQueue(ctx context.Context, opts Options, queue chan<- jobR
 			return nil
 		}
 		for _, row := range final {
-			select {
-			case queue <- row:
-			case <-ctx.Done():
-				return ctx.Err()
+			if err := enqueueJob(ctx, queue, inflight, row); err != nil {
+				return err
 			}
 		}
+	}
+}
+
+func enqueueJob(ctx context.Context, queue chan<- jobRow, inflight *atomic.Int64, row jobRow) error {
+	inflight.Add(1)
+	select {
+	case queue <- row:
+		return nil
+	case <-ctx.Done():
+		inflight.Add(-1)
+		return ctx.Err()
 	}
 }
 
@@ -97,11 +101,11 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
-// runningCount reports the number of jobs currently in 'running' state.
-func (rn *Runner) runningCount(ctx context.Context) (int, error) {
+func (rn *Runner) terminalFailedCount(ctx context.Context, where string) (int, error) {
+	q := `SELECT COUNT(*) FROM jobs WHERE status='failed' AND attempts >= max_attempts` + whereAnd(where)
 	var n int
-	if err := rn.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE status='running'`).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count running: %w", err)
+	if err := rn.db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count terminal failed: %w", err)
 	}
 	return n, nil
 }

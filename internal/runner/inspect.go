@@ -136,6 +136,15 @@ func oneline(argvJSON string) string {
 // event line and then blocks for the next. Otherwise blocks for any event
 // with id > since. Exits after one event.
 func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceID int64, w io.Writer) error {
+	if idFilter != "" {
+		ok, err := rn.jobExists(ctx, idFilter)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("monitor: unknown job id %q", idFilter)
+		}
+	}
 	// If sinceID == 0, print the most recent event right away (if any).
 	if sinceID == 0 {
 		last, ok, err := rn.lastEvent(ctx, idFilter)
@@ -166,6 +175,18 @@ func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceID int64, w
 		case <-ticker.C:
 		}
 	}
+}
+
+func (rn *Runner) jobExists(ctx context.Context, id string) (bool, error) {
+	var n int
+	err := rn.db.QueryRowContext(ctx, `SELECT 1 FROM jobs WHERE job_id = ?`, id).Scan(&n)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probe job id %q: %w", id, err)
+	}
+	return true, nil
 }
 
 type eventRow struct {

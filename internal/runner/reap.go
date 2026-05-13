@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 )
 
 // reapStaleRunning resets any 'running' row whose session-dir flock is no
@@ -32,7 +31,11 @@ func (rn *Runner) reapStaleRunning(ctx context.Context) (int, error) {
 
 	reaped := 0
 	for _, id := range ids {
-		lockPath := filepath.Join(rn.stateDir, id, "lock")
+		jobDir, err := jobDirPath(rn.stateDir, id)
+		if err != nil {
+			continue
+		}
+		lockPath := jobDir + "/lock"
 		avail, err := flockAvailable(lockPath)
 		if err != nil {
 			// Treat unlinkable / unreadable lock as "owner unknown — leave
@@ -43,13 +46,15 @@ func (rn *Runner) reapStaleRunning(ctx context.Context) (int, error) {
 			continue
 		}
 		rn.writeMu.Lock()
-		_, err = rn.db.ExecContext(ctx,
+		res, err := rn.db.ExecContext(ctx,
 			`UPDATE jobs SET status='pending', pid=NULL WHERE job_id=? AND status='running'`, id)
 		rn.writeMu.Unlock()
 		if err != nil {
 			return reaped, fmt.Errorf("reset id=%q: %w", id, err)
 		}
-		reaped++
+		if n, _ := res.RowsAffected(); n > 0 {
+			reaped++
+		}
 	}
 	return reaped, nil
 }
