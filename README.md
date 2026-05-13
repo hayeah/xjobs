@@ -251,11 +251,15 @@ consume, write to the shared SQLite DB via an app-specific table (see
 next section). The PTY captures what an operator would *look at*; the
 DB carries what a script would *parse*.
 
-**MVP today.** PTY integration isn't wired up yet. The current build
-captures stdout + stderr to a plain-text `.xjobs/<id>/output.log` as a
-transitional placeholder — usable for line-oriented children, useless
-for TUI children. It'll be replaced by hootty's binary `pty.hootty.log`
-frame stream when the PTY swap-in lands.
+**MVP today.** All three affordances above already exist as working
+features of the [hootty](https://github.com/hayeah/hootty) CLI/library
+against any hootty state dir — `xjobs` just doesn't import hootty yet
+(the libghostty cgo build adds Zig + CMake + pkg-config to the
+build-prereqs, which the first cut deferred). The current build
+captures stdout + stderr through plain pipes to a placeholder
+`.xjobs/<id>/output.log`: usable for line-oriented children, useless
+for TUI children. Swapping to hootty is a one-function replacement —
+it'll land the whole PTY story (recording, snapshot, attach) at once.
 
 ### Sharing the SQLite DB
 

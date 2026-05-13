@@ -69,11 +69,17 @@ Default state dir is `./.xjobs/` (CWD-relative). Override with
 queues — the natural extension of "every directory is its own scratch
 workspace."
 
-**MVP transitional.** The current build does not yet record a libghostty
-PTY. Instead it captures the child's stdout + stderr through pipes into
-a plain-text `<job-id>/output.log`. Same `lock` file, same role; the
-log file's name and content change when the PTY swap lands (see
-[Future Work](#libghostty-pty-per-job)).
+**MVP transitional.** The PTY capture / replay / attach affordances all
+already exist in the hootty library — `pty.hootty.log` is hootty's
+binary recording format, and `hoot log --format plain` / `hoot attach`
+are working CLI verbs against any hootty state dir. xjobs just doesn't
+import hootty yet, because the libghostty cgo dependency (Zig + CMake +
+pkg-config) is a meaningful build-prereq increase that the first cut
+deferred. The current build spawns children through plain `os.exec`
+pipes and captures stdout + stderr to a placeholder
+`<job-id>/output.log`. Swapping to a hootty session per job is a
+self-contained replacement of `execAttempt` in
+`internal/runner/service.go` and lands the entire PTY story at once.
 
 **Local FS only.** SQLite WAL doesn't work over NFS, and flock semantics
 across boundaries are fragile. Don't.
@@ -354,14 +360,12 @@ The PTY captures what you'd *look at*; the DB carries what you'd
 
 ### MVP today
 
-PTY integration isn't wired up yet — the runner spawns children through
-plain pipes and captures stdout + stderr to a transitional
-`<id>/output.log`. This works for line-oriented children and is awful
-for TUI children, exactly as the framing above predicts. The replacement
-is a Service-seam swap (see
-[libghostty PTY per job](#libghostty-pty-per-job) under Future Work);
-the spec above describes the intended shape, not what's in the build
-today.
+xjobs doesn't import the hootty library yet, so none of the PTY
+affordances above work in the current build. The runner spawns children
+through plain pipes and captures stdout + stderr to a placeholder
+`<id>/output.log`. The PTY capabilities themselves are not future work
+— they already exist in hootty; xjobs just needs to wire them in. See
+[Future Work → libghostty PTY per job](#libghostty-pty-per-job).
 
 ## CLI Surface
 
