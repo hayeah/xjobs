@@ -139,14 +139,14 @@ esac
 	}
 }
 
-func TestE2EResumeReapsAndRerunsAfterKilledRunner(t *testing.T) {
+func TestE2EDrainReapsAndRerunsAfterKilledRunner(t *testing.T) {
 	state := stateDir(t)
 	script := writeExecutable(t, "slow-ok.sh", `#!/bin/sh
 sleep 0.4
 echo slow-ok
 `)
 	cmd := xjobsCommand(state)
-	cmd.Stdin = strings.NewReader(jobJSONL(t, "resume", []string{script}, 0))
+	cmd.Stdin = strings.NewReader(jobJSONL(t, "stranded", []string{script}, 0))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("StdoutPipe: %v", err)
@@ -163,13 +163,15 @@ echo slow-ok
 	_ = cmd.Wait()
 	time.Sleep(700 * time.Millisecond)
 
-	_, resumeStderr, err := runXJobs(t, state, "", "resume")
+	// Bare xjobs with no positional and no stdin = drain-only (the
+	// behavior `resume` used to give us via a dedicated verb).
+	_, drainStderr, err := runXJobs(t, state, "")
 	if code := exitCode(err); code != 0 {
-		t.Fatalf("resume code: got %d, want 0, stderr=%s err=%v", code, resumeStderr, err)
+		t.Fatalf("drain code: got %d, want 0, stderr=%s err=%v", code, drainStderr, err)
 	}
-	job := readJob(t, state, "resume")
+	job := readJob(t, state, "stranded")
 	if job.Status != "done" || job.Attempts != 2 {
-		t.Fatalf("job state after resume: %+v, want done attempt 2", job)
+		t.Fatalf("job state after drain: %+v, want done attempt 2", job)
 	}
 }
 
@@ -327,7 +329,7 @@ func xjobsCommandContext(ctx context.Context, state string, args ...string) *exe
 
 func isVerb(arg string) bool {
 	switch arg {
-	case "run", "resume", "ls", "monitor":
+	case "run", "ls", "monitor":
 		return true
 	default:
 		return false

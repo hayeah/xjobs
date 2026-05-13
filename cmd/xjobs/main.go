@@ -63,36 +63,24 @@ input:
   Duplicate ids are silently skipped (INSERT OR IGNORE).`)
 }
 
-type drainFlags struct {
-	StateDir string
-	Workers  int
-	Where    string
-}
-
-func bindDrainFlags(fs *flag.FlagSet) *drainFlags {
-	c := &drainFlags{}
-	fs.StringVar(&c.StateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
-	fs.IntVar(&c.Workers, "workers", 0, "concurrent job processes (default: NumCPU)")
-	fs.StringVar(&c.Where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
-	return c
-}
-
-func (c *drainFlags) opts() runner.Options {
-	return runner.Options{
-		StateDir: c.StateDir,
-		Workers:  c.Workers,
-		Where:    c.Where,
-	}
+// bindStateDir registers --state-dir on fs and returns a pointer to the
+// parsed value. It's the only flag every subcommand needs.
+func bindStateDir(fs *flag.FlagSet) *string {
+	return fs.String("state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 }
 
 func cmdRun(argv []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	c := bindDrainFlags(fs)
+	stateDir := bindStateDir(fs)
+	var workers int
+	var where string
+	fs.IntVar(&workers, "workers", 0, "concurrent job processes (default: NumCPU)")
+	fs.StringVar(&where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	rest := fs.Args()
-	rn, err := runner.Open(c.StateDir)
+	rn, err := runner.Open(*stateDir)
 	if err != nil {
 		return err
 	}
@@ -118,7 +106,8 @@ func cmdRun(argv []string) error {
 		pumpErrC <- nil
 	}
 
-	drainErr := rn.Drain(ctx, c.opts(), pumpDone, os.Stdout)
+	opts := runner.Options{StateDir: *stateDir, Workers: workers, Where: where}
+	drainErr := rn.Drain(ctx, opts, pumpDone, os.Stdout)
 	pumpErr := <-pumpErrC
 	if pumpErr != nil && !errors.Is(pumpErr, context.Canceled) {
 		return pumpErr
@@ -143,15 +132,15 @@ func runPump(ctx context.Context, rn *runner.Runner, src io.Reader, name string)
 
 func cmdLS(argv []string) error {
 	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
-	var stateDir, where string
+	stateDir := bindStateDir(fs)
+	var where string
 	var jsonOut bool
-	fs.StringVar(&stateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 	fs.StringVar(&where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	fs.BoolVar(&jsonOut, "json", false, "emit JSONL rows instead of text")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	rn, err := runner.Open(stateDir)
+	rn, err := runner.Open(*stateDir)
 	if err != nil {
 		return err
 	}
@@ -171,13 +160,13 @@ func cmdLS(argv []string) error {
 
 func cmdMonitor(argv []string) error {
 	fs := flag.NewFlagSet("monitor", flag.ContinueOnError)
-	var stateDir, id string
-	fs.StringVar(&stateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
+	stateDir := bindStateDir(fs)
+	var id string
 	fs.StringVar(&id, "id", "", "filter to a single job id")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	rn, err := runner.Open(stateDir)
+	rn, err := runner.Open(*stateDir)
 	if err != nil {
 		return err
 	}
