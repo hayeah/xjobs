@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -176,6 +177,89 @@ func TestJobsSchemaShape(t *testing.T) {
 	}
 	if nUnique == 0 {
 		t.Fatalf("expected jobs.job_id to have a UNIQUE index, found none")
+	}
+}
+
+// simulateAttempt drives one full attempt cycle on `id`: claim (bumps
+// attempts, flips status to running) then terminalFail (flips status to
+// failed, leaving attempts at the post-claim value). Mirrors what
+// runOne does on a non-zero exit, but without spawning a child — lets
+// us test work-queue ordering in isolation.
+func simulateAttempt(t *testing.T, rn *Runner, id string, maxAttempts int) {
+	t.Helper()
+	claimed, _, err := rn.claim(context.Background(), id, Options{MaxAttempts: maxAttempts})
+	if err != nil {
+		t.Fatalf("claim %q: %v", id, err)
+	}
+	if !claimed {
+		t.Fatalf("claim %q: not claimed (already terminal or ineligible)", id)
+	}
+	if err := rn.terminalFail(context.Background(), id,
+		sql.NullInt64{Int64: 1, Valid: true}, "", "exit 1"); err != nil {
+		t.Fatalf("terminalFail %q: %v", id, err)
+	}
+}
+
+// TestRetryRoundRobin_OneFailureYieldsToSiblings: when one job fails,
+// the next fetchBatch puts unfailed siblings ahead of it. The failing
+// row carries attempts=1; its siblings are still at attempts=0, so
+// `ORDER BY attempts, id` ranks them first regardless of insertion id.
+func TestRetryRoundRobin_OneFailureYieldsToSiblings(t *testing.T) {
+	rn := newRunnerForTest(t)
+	plan := `{"id":"A","argv":["/usr/bin/false"]}
+{"id":"B","argv":["/usr/bin/false"]}
+{"id":"C","argv":["/usr/bin/false"]}
+`
+	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(plan)); err != nil {
+		t.Fatalf("Pump: %v", err)
+	}
+
+	// A is the lowest-id row (1). Simulate one failed attempt on A.
+	simulateAttempt(t, rn, "A", 3)
+
+	// With the old `ORDER BY id` the order would be [A, B, C] — A's
+	// id=1 wins. With `ORDER BY attempts, id`, A's attempts=1 is
+	// outranked by B and C (still at attempts=0).
+	got := fetchBatchIDs(t, rn)
+	want := []string{"B", "C", "A"}
+	if !equalStrings(got, want) {
+		t.Fatalf("after one failure: got %v, want %v (failing row goes to back)", got, want)
+	}
+}
+
+// TestRetryRoundRobin_AllFailedSiblingsRotateByAttempts: when every
+// row has failed once and then the lowest-id row fails again,
+// fetchBatch should serve the still-at-attempts=1 siblings before the
+// now-at-attempts=2 row.
+func TestRetryRoundRobin_AllFailedSiblingsRotateByAttempts(t *testing.T) {
+	rn := newRunnerForTest(t)
+	plan := `{"id":"A","argv":["/usr/bin/false"]}
+{"id":"B","argv":["/usr/bin/false"]}
+{"id":"C","argv":["/usr/bin/false"]}
+`
+	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(plan)); err != nil {
+		t.Fatalf("Pump: %v", err)
+	}
+
+	// Fail every row at attempt 1 — all three end with attempts=1.
+	for _, id := range []string{"A", "B", "C"} {
+		simulateAttempt(t, rn, id, 3)
+	}
+
+	// All tied at attempts=1 — id is the tiebreaker, so insertion
+	// order is preserved: [A, B, C].
+	if got := fetchBatchIDs(t, rn); !equalStrings(got, []string{"A", "B", "C"}) {
+		t.Fatalf("all-failed-once order: got %v, want [A B C] (insertion order within attempts bucket)", got)
+	}
+
+	// Fail A again — A's attempts goes to 2. B and C still at 1.
+	simulateAttempt(t, rn, "A", 3)
+
+	// Order should rotate: B and C come before A's third try.
+	got := fetchBatchIDs(t, rn)
+	want := []string{"B", "C", "A"}
+	if !equalStrings(got, want) {
+		t.Fatalf("after A's second failure: got %v, want %v (B and C at attempts=1 outrank A at attempts=2)", got, want)
 	}
 }
 

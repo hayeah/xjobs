@@ -59,7 +59,7 @@ usage:
 flags:
   --state-dir <path>     default .xjobs
   --workers N            default NumCPU
-  --max-attempts N       default 3
+  --max-attempts N       default 1 (no auto-retry; raise to allow N total tries)
   --nice N               default 5
   --where '<sql>'        AND-combined with the work-queue predicate
 
@@ -80,7 +80,7 @@ func bindCommon(fs *flag.FlagSet) *commonFlags {
 	c := &commonFlags{}
 	fs.StringVar(&c.StateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 	fs.IntVar(&c.Workers, "workers", 0, "concurrent job processes (default: NumCPU)")
-	fs.IntVar(&c.MaxAttempts, "max-attempts", 3, "retry ceiling for failed rows")
+	fs.IntVar(&c.MaxAttempts, "max-attempts", 1, "max total tries per row (1 = no auto-retry)")
 	fs.IntVar(&c.Nice, "nice", 5, "nice value applied to spawned children")
 	fs.StringVar(&c.Where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	return c

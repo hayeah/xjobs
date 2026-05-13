@@ -23,7 +23,7 @@ import (
 type Options struct {
 	StateDir    string        // default ".xjobs"
 	Workers     int           // default runtime.NumCPU()
-	MaxAttempts int           // default 3
+	MaxAttempts int           // default 1 (no auto-retry)
 	Nice        int           // default 5
 	Where       string        // optional SQL fragment AND-combined with the work-queue predicate
 	PollEvery   time.Duration // how often feedQueue re-scans when idle (default 250ms)
@@ -37,7 +37,7 @@ func (o Options) withDefaults() Options {
 		o.Workers = runtime.NumCPU()
 	}
 	if o.MaxAttempts <= 0 {
-		o.MaxAttempts = 3
+		o.MaxAttempts = 1
 	}
 	if o.PollEvery <= 0 {
 		o.PollEvery = 250 * time.Millisecond
