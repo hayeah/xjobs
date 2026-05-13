@@ -19,7 +19,12 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		if !errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, context.Canceled):
+		case errors.Is(err, errLockHeld):
+			// The "runner.lock held by pid N; ..." line was already
+			// printed by cmdRun; no extra prefix needed.
+		default:
 			fmt.Fprintln(os.Stderr, "xjobs:", err)
 		}
 		os.Exit(1)
@@ -56,6 +61,11 @@ With no input source, run/bare drains the queue and exits — the
 former `+"`"+`xjobs resume`+"`"+` behavior. Pipe `+"`"+`< /dev/null`+"`"+` to force
 drain-only when stdin is already piped.
 
+A `+"`"+`<state_dir>/runner.lock`+"`"+` enforces one drainer per state dir. If
+a second `+"`"+`xjobs`+"`"+` runs against the same dir, the new rows are still
+pumped (the live runner picks them up) and the second invocation
+exits 1 with a stderr line — or exits 0 with `+"`"+`--pump-if-up`+"`"+`.
+
 Run `+"`"+`xjobs <command> -h`+"`"+` for command-specific flags.
 
 input:
@@ -74,8 +84,11 @@ func cmdRun(argv []string) error {
 	stateDir := bindStateDir(fs)
 	var workers int
 	var where string
+	var pumpIfUp bool
 	fs.IntVar(&workers, "workers", 0, "concurrent job processes (default: NumCPU)")
 	fs.StringVar(&where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
+	fs.BoolVar(&pumpIfUp, "pump-if-up", false,
+		"if another xjobs runner already holds the state-dir lock, pump new rows and exit 0 (the live runner drains them). Without this flag, that case exits 1.")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -94,6 +107,34 @@ func cmdRun(argv []string) error {
 		return err
 	}
 
+	acquired, holderPID, err := rn.AcquireDrainerLock()
+	if err != nil {
+		if srcOpen {
+			if c, ok := src.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
+		return fmt.Errorf("acquire runner.lock: %w", err)
+	}
+
+	if !acquired {
+		var ins, skip int
+		if srcOpen {
+			var perr error
+			ins, skip, perr = pumpSync(ctx, rn, src, srcName)
+			if perr != nil && !errors.Is(perr, context.Canceled) {
+				return perr
+			}
+		}
+		fmt.Fprintf(os.Stderr,
+			"xjobs: runner.lock held by pid %d; pumped %d / skipped %d; not draining\n",
+			holderPID, ins, skip)
+		if pumpIfUp {
+			return nil
+		}
+		return errLockHeld
+	}
+
 	pumpDone := make(chan struct{})
 	pumpErrC := make(chan error, 1)
 	if srcOpen {
@@ -104,6 +145,14 @@ func cmdRun(argv []string) error {
 	} else {
 		close(pumpDone)
 		pumpErrC <- nil
+	}
+
+	reaped, err := rn.ReapStaleRunning(ctx)
+	if err != nil {
+		return fmt.Errorf("reaper: %w", err)
+	}
+	if reaped > 0 {
+		fmt.Fprintf(os.Stderr, "xjobs: reaped %d stale running row(s) from prior run\n", reaped)
 	}
 
 	opts := runner.Options{StateDir: *stateDir, Workers: workers, Where: where}
@@ -118,6 +167,11 @@ func cmdRun(argv []string) error {
 	return pumpErr
 }
 
+// errLockHeld signals "another drainer holds runner.lock and --pump-if-up
+// wasn't set" — we want exit code 1 but no extra "xjobs: ..." line on
+// stderr (we already printed the informative one).
+var errLockHeld = errors.New("runner.lock held")
+
 func runPump(ctx context.Context, rn *runner.Runner, src io.Reader, name string) error {
 	ins, skip, total, err := rn.Pump(ctx, src)
 	if c, ok := src.(io.Closer); ok {
@@ -128,6 +182,21 @@ func runPump(ctx context.Context, rn *runner.Runner, src io.Reader, name string)
 	}
 	fmt.Fprintf(os.Stderr, "xjobs: pumped %d / skipped %d / total %d from %s\n", ins, skip, total, name)
 	return nil
+}
+
+// pumpSync runs the pump synchronously and returns the (inserted,
+// skipped) counts. Source is closed before return. Pump-time errors
+// (parse, malformed row) are propagated so the lock-held branch still
+// exits non-zero on bad input.
+func pumpSync(ctx context.Context, rn *runner.Runner, src io.Reader, name string) (int, int, error) {
+	ins, skip, _, err := rn.Pump(ctx, src)
+	if c, ok := src.(io.Closer); ok {
+		_ = c.Close()
+	}
+	if err != nil {
+		return ins, skip, fmt.Errorf("pump %s: %w", name, err)
+	}
+	return ins, skip, nil
 }
 
 func cmdLS(argv []string) error {

@@ -41,6 +41,10 @@ What goes wrong without a convention:
 - **Per-job flock** at `.xjobs/<id>/lock` is the liveness signal. Held
   by the runner for the child's lifetime; released on crash. The reaper
   probes this on the next drain to reclaim stranded rows. No heartbeats.
+- **State-dir runner flock** at `.xjobs/runner.lock` enforces a single
+  drainer per state dir. The pump always runs (the JSONL writer is safe
+  under concurrent writers); the drain only runs if this lock is
+  acquired. See [Single Drainer Per State Dir](#single-drainer-per-state-dir).
 - **Process-shape, not daemon-shape.** `xjobs` is a foreground command
   that inherits env + cwd from the calling shell. There is no `xjobs
   daemon`; a fresh `xjobs` in the same directory resumes the existing
@@ -59,6 +63,7 @@ directory into a set of attachable terminal sessions — parked at
 ├── db.sql3              # SQLite, WAL
 ├── db.sql3-wal
 ├── db.sql3-shm
+├── runner.lock          # exclusive flock held by the live drainer (file body = holder PID)
 └── <job-id>/
     ├── lock             # exclusive flock held for the child's lifetime
     └── output.log       # captured stdout + stderr, appended across attempts
@@ -304,6 +309,62 @@ stale running row(s) from prior run`). It is **not** emitted as an event
 — the next claim of a reaped row produces the user-visible `running` /
 `success` / `error` event for the new attempt.
 
+## Single Drainer Per State Dir
+
+A second concern, distinct from per-job liveness: only one `xjobs` may
+**drain** a state dir at a time. Two live drainers against the same
+`.xjobs/` would race the reaper (one runner's freshly-claimed row, lock
+held but DB row not yet transitioned, looks identical to a stranded row
+to the other runner's reaper) and could double-claim under unlucky SQL
+ordering. The cure is a dedicated state-dir lock.
+
+Every `xjobs run` / bare `xjobs` invocation:
+
+1. **Open the DB.** SQLite is multi-writer-safe under `busy_timeout`, so
+   the DB itself imposes no exclusion.
+2. **Try `flock(LOCK_EX | LOCK_NB)`** on `<state-dir>/runner.lock`. The
+   acquiring runner truncates the file and writes its PID into it — a
+   future contender reads it back so the "lock held by pid N" message
+   names the live runner.
+3. **Branch on the lock:**
+   - **Acquired** — run the reaper, then drain. The lock is held for
+     the runner's lifetime; OS-released on exit or crash. Pump (if any
+     input was given) runs concurrently with drain, as before.
+   - **Held + no flag** — synchronously pump any new rows into the DB
+     (the live runner will see them on its next tick), print
+     `xjobs: runner.lock held by pid N; pumped X / skipped Y; not draining`
+     to stderr, exit `1`. The new rows aren't lost; the loud exit code
+     surfaces "you didn't realize another runner was up."
+   - **Held + `--pump-if-up`** — same pump + stderr line, exit `0`. The
+     cron-friendly variant.
+
+The "always pump, sometimes drain" split keeps the producer side fully
+decoupled from drainer liveness: a script that periodically appends to
+the queue doesn't have to coordinate with the long-running drainer.
+`INSERT OR IGNORE` makes the pump itself safe under concurrent writers,
+so no lock is needed for the pump path.
+
+The drain-only resume path (`xjobs < /dev/null`, or bare `xjobs` with
+no input) goes through the same lock check: acquired → drain; held →
+exits 0 with `--pump-if-up`, exits 1 without.
+
+`xjobs ls` and `xjobs monitor` are read-only and never touch
+`runner.lock`.
+
+### Why a *separate* lock from the per-job locks
+
+The reaper relies on per-job `.xjobs/<id>/lock` files: a `running` row
+whose lock can be acquired is stranded (prior owner dead). That probe
+is racy against a different live runner because it only catches
+"stranded vs. running" in retrospect — between SQL claim and `flock`
+acquire the row looks stranded to anyone else. The state-dir lock
+sidesteps that race entirely: only one runner can be reaping or
+draining, so the per-job probe is always safe in the runner doing it.
+
+A pump-only invocation must **skip** the reaper for the same reason —
+it doesn't hold the state-dir lock, and running the reaper would race
+the live drainer's per-job locks. Reaping is the live runner's job.
+
 ## Events
 
 Each attempt produces two events: a `running` event when the worker
@@ -427,13 +488,14 @@ Flags come **after** the subcommand if you use one. Each subcommand
 only accepts the flags it consumes; run `xjobs <command> -h` for the
 authoritative list. The full set:
 
-| flag          | subcommands         | default  | meaning                                                   |
-|---------------|---------------------|----------|-----------------------------------------------------------|
-| `--state-dir` | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
-| `--workers`   | run                 | `NumCPU` | concurrent job processes                                  |
-| `--where`     | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
-| `--json`      | ls                  | off      | emit JSONL rows instead of text                           |
-| `--id`        | monitor             | (none)   | filter to a single job id                                 |
+| flag            | subcommands         | default  | meaning                                                                       |
+|-----------------|---------------------|----------|-------------------------------------------------------------------------------|
+| `--state-dir`   | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs                                  |
+| `--workers`     | run                 | `NumCPU` | concurrent job processes                                                      |
+| `--where`       | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate                     |
+| `--pump-if-up`  | run                 | off      | if another runner holds `runner.lock`, pump new rows and exit 0 instead of 1  |
+| `--json`        | ls                  | off      | emit JSONL rows instead of text                                               |
+| `--id`          | monitor             | (none)   | filter to a single job id                                                     |
 
 Per-job `nice` and `max_attempts` live on the JSONL row, not on the
 CLI — see [Per-job knobs](#per-job-knobs). The runner has no
@@ -461,8 +523,8 @@ commit. Re-pumping the same file folds in any newly-appended lines (the
 
 | code | meaning                                                            |
 |------|--------------------------------------------------------------------|
-| `0`  | drain completed and no terminal `failed` rows remain               |
-| `1`  | drain completed but some rows are stuck as `failed` (out of retries), or a setup error occurred |
+| `0`  | drain completed and no terminal `failed` rows remain (or `--pump-if-up` saw a live drainer and successfully pumped) |
+| `1`  | drain completed but some rows are stuck as `failed` (out of retries), a setup error occurred, or another runner holds `runner.lock` and `--pump-if-up` was not set |
 
 `bare-xjobs` after a successful pump exits `0` iff every row terminated
 in `done`. This is the contract scripts can rely on.
@@ -559,7 +621,10 @@ the discipline lives in the child.
 ```
 producer ──► xjobs (foreground)
               │
-              ├── stdin or file reader: INSERT OR IGNORE rows into jobs
+              ├── stdin or file reader: INSERT OR IGNORE rows into jobs   (no lock)
+              ├── runner.lock flock (exclusive, held for runner lifetime)
+              │    └── if held by another: pump and exit (1 or 0 per --pump-if-up)
+              ├── reaper pass (gated by the lock)
               ├── work-queue selector: re-scans every 250ms while drain in flight
               ├── worker pool (N goroutines)
               │     each worker:
@@ -573,11 +638,13 @@ producer ──► xjobs (foreground)
 upper bound on concurrent **processes** is `--workers`. Each in-flight
 job consumes one OS process + one open log fd + one flock.
 
-Cross-process safety: a second `xjobs` against the same state dir claims
-distinct rows via the conditional UPDATE. Per-job flock prevents two
-runners from spawning the same job id concurrently even if both pass the
-SQL claim race (defense in depth — the reaper relies on flock
-already, this just makes it tight).
+Cross-process safety: only one drainer at a time per state dir, enforced
+by the `runner.lock` flock (see [Single Drainer Per State Dir](#single-drainer-per-state-dir)).
+A second `xjobs` against the same state dir either pumps-only and exits
+(with or without `--pump-if-up`) or fails loudly with exit 1 — it never
+shares the drain lane with the live runner. The per-job flock and the
+SQL claim's conditional UPDATE still backstop the design, but the
+state-dir lock is what makes them sufficient.
 
 ### Resume semantics
 

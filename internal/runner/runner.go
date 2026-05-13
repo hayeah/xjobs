@@ -48,11 +48,12 @@ func (o Options) withDefaults() Options {
 
 // Runner owns the DB handle and serializes writes for one xjobs process.
 type Runner struct {
-	db       *sql.DB
-	dbPath   string
-	stateDir string
-	writeMu  sync.Mutex
-	tick     *time.Ticker
+	db          *sql.DB
+	dbPath      string
+	stateDir    string
+	writeMu     sync.Mutex
+	tick        *time.Ticker
+	drainerLock *flockHandle
 }
 
 // Open initializes (or opens) the state dir, creates the DB, and returns
@@ -80,7 +81,41 @@ func (rn *Runner) Close() error {
 	if rn.tick != nil {
 		rn.tick.Stop()
 	}
+	if rn.drainerLock != nil {
+		_ = rn.drainerLock.Close()
+		rn.drainerLock = nil
+	}
 	return rn.db.Close()
+}
+
+// AcquireDrainerLock takes the exclusive flock on
+// `<state_dir>/runner.lock` so this process is the sole drainer. On
+// success the handle is owned by the Runner and released on Close. On
+// contention returns (false, holderPID, nil) — the caller can decide
+// whether to fail loudly or pump-and-exit.
+//
+// Calling twice is a programmer error; the second call returns an error.
+func (rn *Runner) AcquireDrainerLock() (acquired bool, holderPID int, err error) {
+	if rn.drainerLock != nil {
+		return false, 0, fmt.Errorf("drainer lock already held")
+	}
+	h, ok, holder, err := acquireRunnerLock(filepath.Join(rn.stateDir, "runner.lock"))
+	if err != nil {
+		return false, 0, err
+	}
+	if !ok {
+		return false, holder, nil
+	}
+	rn.drainerLock = h
+	return true, 0, nil
+}
+
+// ReapStaleRunning runs the reaper pass: resets any 'running' row whose
+// per-job flock has been released (i.e. its prior owner is gone).
+// Returns the number of rows reaped. Caller-driven so the state-dir
+// drainer lock can gate it — see AcquireDrainerLock.
+func (rn *Runner) ReapStaleRunning(ctx context.Context) (int, error) {
+	return rn.reapStaleRunning(ctx)
 }
 
 // DB exposes the underlying handle for ls / monitor / sql verbs.
@@ -92,7 +127,10 @@ func (rn *Runner) StateDir() string { return rn.stateDir }
 // DBPath returns the absolute DB path (the XJOBS env's "db" field).
 func (rn *Runner) DBPath() string { return rn.dbPath }
 
-// Drain runs the worker pool until no eligible row remains.
+// Drain runs the worker pool until no eligible row remains. The caller
+// must hold the state-dir drainer lock (see AcquireDrainerLock) and must
+// have run ReapStaleRunning before this — Drain itself does neither.
+//
 // If pumpDone is non-nil, the drain waits for it to close before deciding
 // to exit on an empty work queue (i.e. it stays alive while a pump is
 // streaming rows in concurrently).
@@ -102,15 +140,6 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 	opts = opts.withDefaults()
 	rn.tick = time.NewTicker(opts.PollEvery)
 	defer rn.tick.Stop()
-
-	// Reaper pass before claiming.
-	reaped, err := rn.reapStaleRunning(ctx)
-	if err != nil {
-		return fmt.Errorf("reaper: %w", err)
-	}
-	if reaped > 0 {
-		fmt.Fprintf(os.Stderr, "xjobs: reaped %d stale running row(s) from prior run\n", reaped)
-	}
 
 	sink := newEventSink(rn, eventsOut)
 
