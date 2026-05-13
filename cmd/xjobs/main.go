@@ -59,40 +59,34 @@ usage:
 flags:
   --state-dir <path>     default .xjobs
   --workers N            default NumCPU
-  --max-attempts N       default 1 (no auto-retry; raise to allow N total tries)
-  --nice N               default 5
   --where '<sql>'        AND-combined with the work-queue predicate
 
 input:
-  JSONL lines: {"id":"…", "cwd":"…", "argv":["…"], "env":{}, "meta":{}}
-  Duplicate ids are silently skipped (INSERT OR IGNORE).`)
+  JSONL lines: {"id":"…", "cwd":"…", "argv":["…"], "env":{}, "meta":{}, "nice":N, "max_attempts":N}
+  Duplicate ids are silently skipped (INSERT OR IGNORE).
+  Children inherit the parent process's priority by default; set per-job "nice" to renice.
+  "max_attempts" defaults to 1 (no auto-retry) when absent.`)
 }
 
 type commonFlags struct {
-	StateDir    string
-	Workers     int
-	MaxAttempts int
-	Nice        int
-	Where       string
+	StateDir string
+	Workers  int
+	Where    string
 }
 
 func bindCommon(fs *flag.FlagSet) *commonFlags {
 	c := &commonFlags{}
 	fs.StringVar(&c.StateDir, "state-dir", ".xjobs", "state dir holding db.sql3 + per-job session dirs")
 	fs.IntVar(&c.Workers, "workers", 0, "concurrent job processes (default: NumCPU)")
-	fs.IntVar(&c.MaxAttempts, "max-attempts", 1, "max total tries per row (1 = no auto-retry)")
-	fs.IntVar(&c.Nice, "nice", 5, "nice value applied to spawned children")
 	fs.StringVar(&c.Where, "where", "", "SQL fragment AND-combined with the work-queue predicate")
 	return c
 }
 
 func (c *commonFlags) opts() runner.Options {
 	return runner.Options{
-		StateDir:    c.StateDir,
-		Workers:     c.Workers,
-		MaxAttempts: c.MaxAttempts,
-		Nice:        c.Nice,
-		Where:       c.Where,
+		StateDir: c.StateDir,
+		Workers:  c.Workers,
+		Where:    c.Where,
 	}
 }
 

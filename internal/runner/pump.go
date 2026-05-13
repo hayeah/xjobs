@@ -14,7 +14,7 @@ import (
 // (already present from a prior pump).
 func (rn *Runner) Pump(ctx context.Context, r io.Reader) (inserted, skipped, total int, err error) {
 	stmt, err := rn.db.PrepareContext(ctx,
-		`INSERT OR IGNORE INTO jobs(job_id, cwd, argv, env, meta) VALUES(?, ?, ?, ?, ?)`)
+		`INSERT OR IGNORE INTO jobs(job_id, cwd, argv, env, meta, nice, max_attempts) VALUES(?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("prepare insert: %w", err)
 	}
@@ -78,10 +78,21 @@ func (rn *Runner) pumpLine(ctx context.Context, stmt *sql.Stmt, line []byte) err
 		metaJSON = j.Meta
 	}
 
+	// nice: NULL when absent so the runner skips the setpriority call.
+	// max_attempts: default to 1 when absent (no auto-retry).
+	var niceArg any
+	if j.Nice != nil {
+		niceArg = *j.Nice
+	}
+	maxAttempts := 1
+	if j.MaxAttempts != nil {
+		maxAttempts = *j.MaxAttempts
+	}
+
 	rn.writeMu.Lock()
 	defer rn.writeMu.Unlock()
 
-	res, err := stmt.ExecContext(ctx, j.ID, j.CWD, string(argvJSON), string(envJSON), string(metaJSON))
+	res, err := stmt.ExecContext(ctx, j.ID, j.CWD, string(argvJSON), string(envJSON), string(metaJSON), niceArg, maxAttempts)
 	if err != nil {
 		return fmt.Errorf("insert id=%q: %w", j.ID, err)
 	}
