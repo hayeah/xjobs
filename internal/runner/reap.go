@@ -12,7 +12,7 @@ import (
 // Silent on the event stream by design: the next claim of a reaped row
 // produces the user-visible success/error event for the new attempt.
 func (rn *Runner) reapStaleRunning(ctx context.Context) (int, error) {
-	rows, err := rn.db.QueryContext(ctx, `SELECT id FROM jobs WHERE status='running'`)
+	rows, err := rn.db.QueryContext(ctx, `SELECT job_id FROM jobs WHERE status='running'`)
 	if err != nil {
 		return 0, fmt.Errorf("scan running rows: %w", err)
 	}
@@ -44,7 +44,7 @@ func (rn *Runner) reapStaleRunning(ctx context.Context) (int, error) {
 		}
 		rn.writeMu.Lock()
 		_, err = rn.db.ExecContext(ctx,
-			`UPDATE jobs SET status='pending', pid=NULL WHERE id=? AND status='running'`, id)
+			`UPDATE jobs SET status='pending', pid=NULL WHERE job_id=? AND status='running'`, id)
 		rn.writeMu.Unlock()
 		if err != nil {
 			return reaped, fmt.Errorf("reset id=%q: %w", id, err)

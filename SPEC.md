@@ -139,8 +139,8 @@ caller data goes in `meta`.
 
 ```sql
 CREATE TABLE jobs (
-    n           INTEGER PRIMARY KEY AUTOINCREMENT,      -- insertion-order ordinal; work-queue ORDER BY
-    id          TEXT NOT NULL UNIQUE,                   -- user-supplied job id; INSERT OR IGNORE dedups on this
+    id          INTEGER PRIMARY KEY,                    -- rowid alias; insertion-order ordinal; work-queue ORDER BY
+    job_id      TEXT NOT NULL UNIQUE,                   -- user-supplied job id; INSERT OR IGNORE dedups on this
     cwd         TEXT NOT NULL,
     argv        TEXT NOT NULL,                          -- JSON array
     env         TEXT NOT NULL DEFAULT '{}',             -- JSON object
@@ -158,17 +158,19 @@ CREATE TABLE jobs (
 CREATE INDEX idx_jobs_status ON jobs(status);
 ```
 
-The primary key is the integer `n`, auto-assigned by SQLite at INSERT
-time. The user-supplied `id` keeps its uniqueness via `UNIQUE(id)` so
-`INSERT OR IGNORE` continues to dedup pumps; it just isn't the PK
-anymore. This is what lets the work-queue drain in JSONL insertion
-order — `ORDER BY n` is true insertion order, not the alphabetical
-order of user-supplied ids.
+The primary key is the integer `id` — a rowid alias auto-assigned by
+SQLite at INSERT time (no AUTOINCREMENT; xjobs never deletes rows, so
+rowid-reuse semantics are irrelevant). The user-supplied `job_id` keeps
+its uniqueness via `UNIQUE(job_id)` so `INSERT OR IGNORE` continues to
+dedup pumps. This is what lets the work-queue drain in JSONL insertion
+order — `ORDER BY id` is true insertion order, not the alphabetical
+order of user-supplied job ids.
 
-State-column names (`n`, `status`, `attempts`, `pid`, `exit_code`,
+State-column names (`id`, `status`, `attempts`, `pid`, `exit_code`,
 `signal`, `session_key`, `started_at`, `ended_at`, `error`, `meta`) are
-reserved — the JSONL line cannot use them as top-level fields. The
-runner stores the caller's free-form data only in `meta`.
+reserved — the JSONL line's `id` is mapped onto the `job_id` column,
+and the other state columns cannot be used as top-level JSONL fields.
+The runner stores the caller's free-form data only in `meta`.
 
 **Fresh schema only.** `ensureSchema` defines the shape above and runs
 no migrations. A pre-existing `.xjobs/db.sql3` from an earlier xjobs
@@ -185,7 +187,7 @@ WHERE status = 'pending'
 by the reaper pass at drain start (next section). User `--where`
 fragments AND-combine after the built-in predicate.
 
-Eligible rows are drained `ORDER BY n` — i.e. in JSONL insertion order.
+Eligible rows are drained `ORDER BY id` — i.e. in JSONL insertion order.
 This matters when a hand-written plan is ordered by some real-world
 dependency (download → transcode → upload, or a deliberate priority
 hand-sort): the queue respects that order instead of imposing an
@@ -273,12 +275,12 @@ xjobs's stdout as JSONL when running in foreground.
 
 ```sql
 CREATE TABLE events (
-    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    id       INTEGER PRIMARY KEY,                          -- rowid alias; events are append-only
     ts       TIMESTAMP NOT NULL,
-    job_id   TEXT NOT NULL,
+    job_id   INTEGER NOT NULL REFERENCES jobs(id),         -- integer FK to jobs.id
     attempt  INTEGER NOT NULL,
-    kind     TEXT NOT NULL,                  -- running | success | error
-    data     TEXT NOT NULL DEFAULT '{}'      -- JSON of the full event
+    kind     TEXT NOT NULL,                                -- running | success | error
+    data     TEXT NOT NULL DEFAULT '{}'                    -- JSON of the full event
 );
 CREATE INDEX idx_events_job_id ON events(job_id);
 ```
@@ -326,9 +328,10 @@ xjobs monitor                  # print most recent event, then block for next
 xjobs monitor --id ID          # filter to one job's events
 ```
 
-The `monitor` verb tails the events table via `SELECT ... WHERE seq >
-:since ORDER BY seq LIMIT 1` in a 200ms poll loop. Returns after one
-event. Agents loop on it to wait for "the next interesting thing."
+The `monitor` verb tails the events table via `SELECT ... WHERE id >
+:since ORDER BY id LIMIT 1` in a 200ms poll loop (filtering by user-
+supplied job id joins against `jobs.job_id`). Returns after one event.
+Agents loop on it to wait for "the next interesting thing."
 
 ## Observing a Job's Output
 
@@ -424,10 +427,14 @@ everything an operator might want to query lives in one file. Later
 analytics join app rows back to `jobs` by `job_id`:
 
 ```sql
-SELECT j.id, j.status, u.bytes_sent, u.remote_url
-FROM jobs j JOIN uploads u ON u.job_id = j.id
+SELECT j.job_id, j.status, u.bytes_sent, u.remote_url
+FROM jobs j JOIN uploads u ON u.job_id = j.job_id
 WHERE j.status = 'done';
 ```
+
+(App tables typically key on the user-supplied id, since that's what
+the child receives via `XJOBS.job_id`. The runner's own `events.job_id`
+is the integer FK to `jobs.id` instead — see the events schema above.)
 
 WAL + `busy_timeout=5000` handles the contention. The runner writes only
 on state transitions (claim, terminal, reap) — no per-tick heartbeat

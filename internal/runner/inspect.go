@@ -24,7 +24,7 @@ type LSRow struct {
 
 // LS returns all jobs ordered by (status precedence, started_at).
 func (rn *Runner) LS(ctx context.Context, where string) ([]LSRow, error) {
-	q := `SELECT id, status, attempts, exit_code, signal, started_at, ended_at, argv, error
+	q := `SELECT job_id, status, attempts, exit_code, signal, started_at, ended_at, argv, error
 	        FROM jobs`
 	if where != "" {
 		q += " WHERE " + where
@@ -36,7 +36,7 @@ func (rn *Runner) LS(ctx context.Context, where string) ([]LSRow, error) {
 	                  WHEN 'done'    THEN 3
 	                  ELSE 4 END,
 	                started_at,
-	                id`
+	                job_id`
 	rows, err := rn.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("ls query: %w", err)
@@ -134,10 +134,10 @@ func oneline(argvJSON string) string {
 
 // Monitor tails the events table. If since == 0, prints the most recent
 // event line and then blocks for the next. Otherwise blocks for any event
-// with seq > since. Exits after one event.
-func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceSeq int64, w io.Writer) error {
-	// If sinceSeq == 0, print the most recent event right away (if any).
-	if sinceSeq == 0 {
+// with id > since. Exits after one event.
+func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceID int64, w io.Writer) error {
+	// If sinceID == 0, print the most recent event right away (if any).
+	if sinceID == 0 {
 		last, ok, err := rn.lastEvent(ctx, idFilter)
 		if err != nil {
 			return err
@@ -146,13 +146,13 @@ func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceSeq int64, 
 			if _, err := w.Write(append([]byte(last.Data), '\n')); err != nil {
 				return err
 			}
-			sinceSeq = last.Seq
+			sinceID = last.ID
 		}
 	}
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		next, ok, err := rn.nextEvent(ctx, idFilter, sinceSeq)
+		next, ok, err := rn.nextEvent(ctx, idFilter, sinceID)
 		if err != nil {
 			return err
 		}
@@ -169,20 +169,20 @@ func (rn *Runner) Monitor(ctx context.Context, idFilter string, sinceSeq int64, 
 }
 
 type eventRow struct {
-	Seq  int64
+	ID   int64
 	Data string
 }
 
 func (rn *Runner) lastEvent(ctx context.Context, idFilter string) (eventRow, bool, error) {
-	q := `SELECT seq, data FROM events`
+	q := `SELECT e.id, e.data FROM events e`
 	args := []any{}
 	if idFilter != "" {
-		q += ` WHERE job_id = ?`
+		q += ` JOIN jobs j ON e.job_id = j.id WHERE j.job_id = ?`
 		args = append(args, idFilter)
 	}
-	q += ` ORDER BY seq DESC LIMIT 1`
+	q += ` ORDER BY e.id DESC LIMIT 1`
 	var r eventRow
-	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.Seq, &r.Data)
+	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.ID, &r.Data)
 	if err == sql.ErrNoRows {
 		return r, false, nil
 	}
@@ -193,15 +193,18 @@ func (rn *Runner) lastEvent(ctx context.Context, idFilter string) (eventRow, boo
 }
 
 func (rn *Runner) nextEvent(ctx context.Context, idFilter string, since int64) (eventRow, bool, error) {
-	q := `SELECT seq, data FROM events WHERE seq > ?`
-	args := []any{since}
+	q := `SELECT e.id, e.data FROM events e`
+	args := []any{}
 	if idFilter != "" {
-		q += ` AND job_id = ?`
-		args = append(args, idFilter)
+		q += ` JOIN jobs j ON e.job_id = j.id WHERE j.job_id = ? AND e.id > ?`
+		args = append(args, idFilter, since)
+	} else {
+		q += ` WHERE e.id > ?`
+		args = append(args, since)
 	}
-	q += ` ORDER BY seq ASC LIMIT 1`
+	q += ` ORDER BY e.id ASC LIMIT 1`
 	var r eventRow
-	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.Seq, &r.Data)
+	err := rn.db.QueryRowContext(ctx, q, args...).Scan(&r.ID, &r.Data)
 	if err == sql.ErrNoRows {
 		return r, false, nil
 	}

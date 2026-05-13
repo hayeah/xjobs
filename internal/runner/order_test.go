@@ -59,26 +59,27 @@ func TestPumpWorkQueueInsertionOrder(t *testing.T) {
 	}
 }
 
-// TestPumpNIsMonotonic: the integer PK `n` is assigned monotonically in
-// insertion order. `n` values are 1..N in the order rows were inserted.
-func TestPumpNIsMonotonic(t *testing.T) {
+// TestPumpIDIsMonotonic: the integer PK `id` is assigned monotonically
+// in insertion order. `id` values are 1..N in the order rows were
+// inserted.
+func TestPumpIDIsMonotonic(t *testing.T) {
 	rn := newRunnerForTest(t)
 	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(orderJSONL)); err != nil {
 		t.Fatalf("Pump: %v", err)
 	}
-	rows, err := rn.db.Query(`SELECT id, n FROM jobs ORDER BY n`)
+	rows, err := rn.db.Query(`SELECT job_id, id FROM jobs ORDER BY id`)
 	if err != nil {
-		t.Fatalf("query n: %v", err)
+		t.Fatalf("query id: %v", err)
 	}
 	defer rows.Close()
 	type pair struct {
-		ID string
-		N  int64
+		JobID string
+		ID    int64
 	}
 	var got []pair
 	for rows.Next() {
 		var p pair
-		if err := rows.Scan(&p.ID, &p.N); err != nil {
+		if err := rows.Scan(&p.JobID, &p.ID); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		got = append(got, p)
@@ -94,9 +95,10 @@ func TestPumpNIsMonotonic(t *testing.T) {
 	}
 }
 
-// TestPumpDuplicatesAreIgnored: re-inserting a known id is a no-op via
-// `INSERT OR IGNORE` on the UNIQUE(id) constraint. Pump counts skip vs.
-// ins correctly, and the original `n` of the surviving row is unchanged.
+// TestPumpDuplicatesAreIgnored: re-inserting a known job_id is a no-op
+// via `INSERT OR IGNORE` on the UNIQUE(job_id) constraint. Pump counts
+// skip vs. ins correctly, and the original `id` of the surviving row is
+// unchanged.
 func TestPumpDuplicatesAreIgnored(t *testing.T) {
 	rn := newRunnerForTest(t)
 	first := `{"id":"a","argv":["/bin/true"]}
@@ -105,10 +107,10 @@ func TestPumpDuplicatesAreIgnored(t *testing.T) {
 	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(first)); err != nil {
 		t.Fatalf("Pump first: %v", err)
 	}
-	// Snapshot a's n before re-pumping.
+	// Snapshot a's id before re-pumping.
 	var aBefore int64
-	if err := rn.db.QueryRow(`SELECT n FROM jobs WHERE id='a'`).Scan(&aBefore); err != nil {
-		t.Fatalf("read a.n: %v", err)
+	if err := rn.db.QueryRow(`SELECT id FROM jobs WHERE job_id='a'`).Scan(&aBefore); err != nil {
+		t.Fatalf("read a.id: %v", err)
 	}
 
 	// Re-pump 'a' (dup) and add 'c'.
@@ -123,14 +125,14 @@ func TestPumpDuplicatesAreIgnored(t *testing.T) {
 		t.Fatalf("second Pump counts: ins=%d skip=%d total=%d, want 1/1/2", ins, skip, total)
 	}
 
-	// 'a' still has its original n (the dup INSERT OR IGNORE didn't
+	// 'a' still has its original id (the dup INSERT OR IGNORE didn't
 	// touch the row).
 	var aAfter int64
-	if err := rn.db.QueryRow(`SELECT n FROM jobs WHERE id='a'`).Scan(&aAfter); err != nil {
-		t.Fatalf("read a.n after: %v", err)
+	if err := rn.db.QueryRow(`SELECT id FROM jobs WHERE job_id='a'`).Scan(&aAfter); err != nil {
+		t.Fatalf("read a.id after: %v", err)
 	}
 	if aAfter != aBefore {
-		t.Fatalf("a.n changed across dup pump: before=%d after=%d", aBefore, aAfter)
+		t.Fatalf("a.id changed across dup pump: before=%d after=%d", aBefore, aAfter)
 	}
 
 	// Insertion order for the work-queue is a, b, c — the dup of 'a'
@@ -141,39 +143,39 @@ func TestPumpDuplicatesAreIgnored(t *testing.T) {
 	}
 }
 
-// TestJobsSchemaShape: pin the schema. `n` is the integer PRIMARY KEY
-// (rowid alias) and `id` is UNIQUE. Catches accidental reverts.
+// TestJobsSchemaShape: pin the schema. `id` is the integer PRIMARY KEY
+// (rowid alias) and `job_id` is UNIQUE. Catches accidental reverts.
 func TestJobsSchemaShape(t *testing.T) {
 	rn := newRunnerForTest(t)
-	// `n` is the rowid alias: its `pk` flag in table_info is 1.
+	// `id` is the rowid alias: its `pk` flag in table_info is 1.
 	var pk int
-	if err := rn.db.QueryRow(
-		`SELECT pk FROM pragma_table_info('jobs') WHERE name='n'`).Scan(&pk); err != nil {
-		t.Fatalf("probe n.pk: %v", err)
-	}
-	if pk != 1 {
-		t.Fatalf("expected jobs.n to be the primary key (pk=1), got pk=%d", pk)
-	}
-	// `id` is NOT the primary key (pk=0) — it lost PRIMARY KEY to `n`.
 	if err := rn.db.QueryRow(
 		`SELECT pk FROM pragma_table_info('jobs') WHERE name='id'`).Scan(&pk); err != nil {
 		t.Fatalf("probe id.pk: %v", err)
 	}
-	if pk != 0 {
-		t.Fatalf("expected jobs.id to NOT be the primary key (pk=0), got pk=%d", pk)
+	if pk != 1 {
+		t.Fatalf("expected jobs.id to be the primary key (pk=1), got pk=%d", pk)
 	}
-	// But `id` must have a UNIQUE index for `INSERT OR IGNORE` dedup.
-	// `pragma_index_list` reports indexes; the auto-index for UNIQUE has
-	// `unique=1`.
+	// `job_id` is NOT the primary key (pk=0).
+	if err := rn.db.QueryRow(
+		`SELECT pk FROM pragma_table_info('jobs') WHERE name='job_id'`).Scan(&pk); err != nil {
+		t.Fatalf("probe job_id.pk: %v", err)
+	}
+	if pk != 0 {
+		t.Fatalf("expected jobs.job_id to NOT be the primary key (pk=0), got pk=%d", pk)
+	}
+	// But `job_id` must have a UNIQUE index for `INSERT OR IGNORE`
+	// dedup. `pragma_index_list` reports indexes; the auto-index for
+	// UNIQUE has `unique=1`.
 	var nUnique int
 	if err := rn.db.QueryRow(`
 		SELECT COUNT(*) FROM pragma_index_list('jobs') il
 		  JOIN pragma_index_info(il.name) ii ON 1=1
-		 WHERE il."unique" = 1 AND ii.name = 'id'`).Scan(&nUnique); err != nil {
-		t.Fatalf("probe id uniqueness: %v", err)
+		 WHERE il."unique" = 1 AND ii.name = 'job_id'`).Scan(&nUnique); err != nil {
+		t.Fatalf("probe job_id uniqueness: %v", err)
 	}
 	if nUnique == 0 {
-		t.Fatalf("expected jobs.id to have a UNIQUE index, found none")
+		t.Fatalf("expected jobs.job_id to have a UNIQUE index, found none")
 	}
 }
 
