@@ -30,7 +30,7 @@ func newRunnerForTest(t *testing.T) *Runner {
 
 func fetchBatchIDs(t *testing.T, rn *Runner) []string {
 	t.Helper()
-	rows, err := rn.fetchBatch(context.Background(), Options{MaxAttempts: 3}, map[string]int64{})
+	rows, err := rn.fetchBatch(context.Background(), Options{}, map[string]int64{})
 	if err != nil {
 		t.Fatalf("fetchBatch: %v", err)
 	}
