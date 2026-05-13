@@ -273,10 +273,14 @@ a separate sidecar store. Later analytics join app rows back to `jobs` by
 `job_id`:
 
 ```sql
-SELECT j.id, j.status, u.bytes_sent, u.remote_url
-FROM jobs j JOIN uploads u ON u.job_id = j.id
+SELECT j.job_id, j.status, u.bytes_sent, u.remote_url
+FROM jobs j JOIN uploads u ON u.job_id = j.job_id
 WHERE j.status = 'done';
 ```
+
+App tables typically key on the user-supplied id (the same string the
+child sees as `XJOBS.job_id`). The runner's own `events.job_id` column
+is the integer FK to `jobs.id`.
 
 The DB is opened in WAL mode with `busy_timeout=5000`, so concurrent
 writers from N child processes work fine. Use whatever SQLite library
