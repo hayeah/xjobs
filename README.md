@@ -367,4 +367,4 @@ Deferred (the spec covers these; not yet implemented):
   ctx-cancel propagates to `exec.CommandContext` and SIGKILLs the child
   immediately.
 
-Full design: `~/Dropbox/notes/2026-05-13/xjobs-spec_claude.md`.
+Full design: [`SPEC.md`](SPEC.md).
