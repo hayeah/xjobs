@@ -93,13 +93,14 @@ Flags must come **after** the subcommand if you use one. Each
 subcommand only registers the flags it consumes — use `xjobs <command>
 -h` for the authoritative list. The full set:
 
-| flag          | subcommands         | default  | meaning                                                   |
-|---------------|---------------------|----------|-----------------------------------------------------------|
-| `--state-dir` | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
-| `--workers`   | run                 | `NumCPU` | concurrent job processes                                  |
-| `--where`     | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
-| `--json`      | ls                  | off      | emit JSONL rows instead of text                           |
-| `--id`        | monitor             | (none)   | filter to a single job id                                 |
+| flag            | subcommands         | default  | meaning                                                                       |
+|-----------------|---------------------|----------|-------------------------------------------------------------------------------|
+| `--state-dir`   | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs                                  |
+| `--workers`     | run                 | `NumCPU` | concurrent job processes                                                      |
+| `--where`       | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate                     |
+| `--pump-if-up`  | run                 | off      | if another runner holds `runner.lock`, pump new rows and exit 0 instead of 1  |
+| `--json`        | ls                  | off      | emit JSONL rows instead of text                                               |
+| `--id`          | monitor             | (none)   | filter to a single job id                                                     |
 
 Per-job priority and retry are JSONL fields, not flags — see
 [Writing a job](#writing-a-job). Retries round-robin across siblings:
@@ -117,7 +118,30 @@ next interesting thing." `--id ID` filters to one exact job id.
 ### Exit codes
 
 - `0` — drain completed and no terminal `failed` rows remain.
-- `1` — drain completed but some rows are still `failed` (out of retries), or a setup error occurred.
+- `1` — drain completed but some rows are still `failed` (out of retries), a setup error occurred, or another runner already holds `runner.lock` and `--pump-if-up` was not set.
+
+### Single drainer per state dir
+
+Every `xjobs run` (and bare `xjobs`) takes an exclusive `flock` on
+`<state-dir>/runner.lock` for its lifetime. The lock is OS-released on
+exit or crash. If a second invocation runs against the same state dir
+while the first is alive:
+
+- The second invocation **still pumps** any new JSONL rows into the DB
+  (the queue is safe under concurrent writers — that's what `INSERT OR
+  IGNORE` is for). It prints a stderr line like
+  `xjobs: runner.lock held by pid 12345; pumped 4 / skipped 0; not draining`.
+- Without `--pump-if-up`, it then exits `1` (loud failure — surfaces
+  "you didn't realize another runner was up").
+- With `--pump-if-up`, it exits `0`. The live runner picks up the
+  pumped rows on its next poll tick (~250 ms).
+
+`--pump-if-up` is the cron-friendly mode: a scheduled "top up the
+queue" job can fire on a regular cadence without caring whether a
+drainer is already running.
+
+`xjobs ls` and `xjobs monitor` are read-only and don't touch
+`runner.lock`.
 
 ## Writing a job
 
@@ -388,6 +412,7 @@ sqlite3 .xjobs/db.sql3 'SELECT COUNT(*), AVG(result_n) FROM results;'
 ├── db.sql3              # SQLite, WAL
 ├── db.sql3-wal
 ├── db.sql3-shm
+├── runner.lock          # exclusive flock held by the live drainer for its lifetime
 └── <job-id>/            # one dir per attempted job
     ├── lock             # exclusive flock held for the child's lifetime
     └── output.log       # captured stdout + stderr, appended across attempts
@@ -395,6 +420,11 @@ sqlite3 .xjobs/db.sql3 'SELECT COUNT(*), AVG(result_n) FROM results;'
 
 Default state dir is `./.xjobs/`. Override with `--state-dir <path>`.
 Multiple state dirs in different CWDs are independent queues.
+
+`runner.lock` is the single-drainer-per-state-dir gate. The live runner
+truncates and writes its PID into the file so a contender can surface
+it in the "lock held by pid N" message. See
+[Single drainer per state dir](#single-drainer-per-state-dir).
 
 `<job-id>/lock` is the liveness signal: while a runner is hosting the
 child, the flock is held; if the runner dies, the OS releases it. On the
@@ -418,6 +448,8 @@ Early MVP. Working:
   table.
 - Verbs: bare / `run` / `ls` / `monitor`. (Bare with no input source
   is the resume path — drains the existing queue and exits.)
+- Single drainer per state dir via `runner.lock`; `--pump-if-up`
+  cron-friendly mode for top-up invocations.
 
 Deferred (the spec covers these; not yet implemented):
 
