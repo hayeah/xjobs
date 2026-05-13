@@ -413,18 +413,27 @@ alongside the PTY integration as pass-throughs to hootty.
 ```
 xjobs [flags] [<file.jsonl> | -]   pump (file > stdin > none) + drain
 xjobs run     [flags] [<file.jsonl>]   same as bare
-xjobs resume  [flags]                  drain only; ignore any stdin
-xjobs ls      [flags] [--json]
+xjobs ls      [flags] [--json] [--where SQL]
 xjobs monitor [flags] [--id ID]
 ```
 
-Flags come **after** the subcommand if you use one:
+There is no separate `resume` verb. `xjobs` / `xjobs run` with no
+input source — no positional, no piped stdin — *is* the resume path:
+it drains whatever's already in the work-queue and exits. To force
+drain-only when stdin is already piped at you, close it: `xjobs
+< /dev/null`.
 
-| flag          | default  | meaning                                                   |
-|---------------|----------|-----------------------------------------------------------|
-| `--state-dir` | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
-| `--workers`   | `NumCPU` | concurrent job processes                                  |
-| `--where`     | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+Flags come **after** the subcommand if you use one. Each subcommand
+only accepts the flags it consumes; run `xjobs <command> -h` for the
+authoritative list. The full set:
+
+| flag          | subcommands         | default  | meaning                                                   |
+|---------------|---------------------|----------|-----------------------------------------------------------|
+| `--state-dir` | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
+| `--workers`   | run                 | `NumCPU` | concurrent job processes                                  |
+| `--where`     | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+| `--json`      | ls                  | off      | emit JSONL rows instead of text                           |
+| `--id`        | monitor             | (none)   | filter to a single job id                                 |
 
 Per-job `nice` and `max_attempts` live on the JSONL row, not on the
 CLI — see [Per-job knobs](#per-job-knobs). The runner has no
@@ -441,7 +450,7 @@ xjobs jobs.jsonl                # pump from file, then drain
 producer | xjobs                # pump from stdin, then drain
 xjobs                           # no pump; just drain what's already in the DB
 xjobs - < jobs.jsonl            # explicit stdin (matches `cat`, `jq` conventions)
-xjobs resume                    # forced drain-only even if stdin is piped
+xjobs < /dev/null               # force drain-only when stdin is already piped at you
 ```
 
 File mode is the script-friendly path: generate JSONL, eyeball it,
@@ -572,10 +581,18 @@ already, this just makes it tight).
 
 ### Resume semantics
 
-`xjobs` with no stdin pipe (tty stdin or `< /dev/null`) is the resume
-verb. It opens the existing state dir, runs the work-queue predicate,
-and drains whatever is eligible. Same operation as the initial pump —
-only the "INSERT new rows from stdin" prefix differs.
+`xjobs` with no input source (no positional, no piped stdin — i.e. tty
+stdin or `< /dev/null`) is the resume path. It opens the existing
+state dir, runs the work-queue predicate, and drains whatever is
+eligible. Same operation as the initial pump — only the "INSERT new
+rows from stdin" prefix differs.
+
+This is why there is no dedicated `resume` verb. The pump-source
+sniffer already degrades to drain-only when nothing's been handed in,
+which is exactly the operation a separate verb would have performed.
+The one corner case — *stdin is piped at me but I want to ignore it*
+— is recoverable as `xjobs < /dev/null`, the same hatch every other
+Unix tool offers.
 
 There is no separate `init` verb. The state dir is created lazily on
 first write. Wiping a run is `rm -rf .xjobs/`.
@@ -662,9 +679,9 @@ Leaning toward the second; revisit when a real workload presses on it.
   the user supplying `--where` or `xjobs sql` is the user who owns the
   DB file. Documented, not sandboxed.
 
-- **Subcommand-flag ordering.** `xjobs resume --workers 4` works;
-  `xjobs --workers 4 resume` does not — the dispatcher routes by
-  `argv[0]`. Standard for subcommand CLIs.
+- **Subcommand-flag ordering.** `xjobs ls --where "status='failed'"`
+  works; `xjobs --where "status='failed'" ls` does not — the
+  dispatcher routes by `argv[0]`. Standard for subcommand CLIs.
 
 - **State dir on local FS.** SQLite WAL doesn't work over NFS, and
   flock semantics are fragile across network boundaries. Don't put

@@ -60,12 +60,15 @@ watch the terminal scroll.
 ## CLI
 
 ```
-xjobs [flags] [<file.jsonl> | -]   pump (file > stdin > none) + drain
-xjobs run     [flags] [<file.jsonl>]   same as bare
-xjobs resume  [flags]                  drain only; ignore any stdin
-xjobs ls      [flags] [--json]
+xjobs [flags] [<file.jsonl> | -]       pump + drain (alias for `run`)
+xjobs run     [flags] [<file.jsonl>]
+xjobs ls      [flags] [--json] [--where SQL]
 xjobs monitor [flags] [--id ID]
 ```
+
+With no input source, `xjobs` / `xjobs run` drains the queue and exits
+— that's the resume path. There's no separate `resume` verb. Run
+`xjobs <command> -h` for command-specific flags.
 
 **Input precedence: file arg > piped stdin > none.**
 
@@ -74,7 +77,7 @@ xjobs jobs.jsonl                # pump from file, then drain
 producer | xjobs                # pump from stdin, then drain
 xjobs                           # no pump; just drain what's already in the DB
 xjobs - < jobs.jsonl            # explicit stdin (useful in scripts)
-xjobs resume                    # forced drain-only even if you piped stdin
+xjobs < /dev/null               # force drain-only when stdin is already piped at you
 ```
 
 Re-pumping the same file is safe: ids are deduped via `INSERT OR IGNORE`,
@@ -86,13 +89,17 @@ the order of lines in your JSONL is the order workers will claim them.
 If a plan is hand-sorted by some real-world priority (download before
 transcode before upload, etc.), that order is honored.
 
-Flags (must come **after** the subcommand if you use one):
+Flags must come **after** the subcommand if you use one. Each
+subcommand only registers the flags it consumes — use `xjobs <command>
+-h` for the authoritative list. The full set:
 
-| flag          | default  | meaning                                                   |
-|---------------|----------|-----------------------------------------------------------|
-| `--state-dir` | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
-| `--workers`   | `NumCPU` | concurrent job processes                                  |
-| `--where`     | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+| flag          | subcommands         | default  | meaning                                                   |
+|---------------|---------------------|----------|-----------------------------------------------------------|
+| `--state-dir` | run / ls / monitor  | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
+| `--workers`   | run                 | `NumCPU` | concurrent job processes                                  |
+| `--where`     | run / ls            | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+| `--json`      | ls                  | off      | emit JSONL rows instead of text                           |
+| `--id`        | monitor             | (none)   | filter to a single job id                                 |
 
 Per-job priority and retry are JSONL fields, not flags — see
 [Writing a job](#writing-a-job). Retries round-robin across siblings:
@@ -409,7 +416,8 @@ Early MVP. Working:
 - Retry on failure up to the row's per-job `max_attempts` (default 1).
 - `running` / `success` / `error` events on stdout and in the `events`
   table.
-- Verbs: bare / `run` / `resume` / `ls` / `monitor`.
+- Verbs: bare / `run` / `ls` / `monitor`. (Bare with no input source
+  is the resume path — drains the existing queue and exits.)
 
 Deferred (the spec covers these; not yet implemented):
 
