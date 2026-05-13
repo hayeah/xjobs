@@ -88,13 +88,16 @@ transcode before upload, etc.), that order is honored.
 
 Flags (must come **after** the subcommand if you use one):
 
-| flag             | default     | meaning                                                       |
-|------------------|-------------|---------------------------------------------------------------|
-| `--state-dir`    | `.xjobs`    | dir holding `db.sql3` + per-job session dirs                  |
-| `--workers`      | `NumCPU`    | concurrent job processes                                      |
-| `--max-attempts` | `1`         | max total tries per row; `1` = no auto-retry. Retries round-robin across siblings (a failing row yields the worker to other ready rows before its next try). |
-| `--nice`         | `5`         | nice value applied to spawned children                        |
-| `--where`        | (none)      | SQL fragment `AND`-combined with the work-queue predicate     |
+| flag          | default  | meaning                                                   |
+|---------------|----------|-----------------------------------------------------------|
+| `--state-dir` | `.xjobs` | dir holding `db.sql3` + per-job session dirs              |
+| `--workers`   | `NumCPU` | concurrent job processes                                  |
+| `--where`     | (none)   | SQL fragment `AND`-combined with the work-queue predicate |
+
+Per-job priority and retry are JSONL fields, not flags — see
+[Writing a job](#writing-a-job). Retries round-robin across siblings:
+a failing row yields the worker to other ready rows before its next
+try.
 
 `xjobs ls` shows one line per job, sorted `running → pending → failed →
 done`. `--json` emits JSONL of the row with parsed argv — pipe through
@@ -112,9 +115,11 @@ next interesting thing." `--id <prefix>` filters to one job.
 ## Writing a job
 
 A job is just a process. xjobs spawns it like a shell would: with your
-`argv`, with your `cwd`, with your env plus a few injected vars. The
-runner doesn't care what language the child is in, what it does, or how
-long it takes — only its exit code.
+`argv`, with your `cwd`, with your env plus a few injected vars. By
+default the child inherits the parent shell's priority — no
+`setpriority` call — matching the "I'm launching this from my active
+shell" mental model. The runner doesn't care what language the child
+is in, what it does, or how long it takes — only its exit code.
 
 ### JSONL line shape
 
@@ -124,12 +129,23 @@ long it takes — only its exit code.
   "cwd":  "/abs/or/relative/path",   // optional; default = xjobs's CWD
   "argv": ["./worker", "download", "tt0133093"],
   "env":  { "FOO": "bar" },          // optional; merged onto inherited env
-  "meta": { "size": 12345678 }       // optional; free-form, lands in jobs.meta
+  "meta": { "size": 12345678 },      // optional; free-form, lands in jobs.meta
+  "nice": 10,                        // optional; renice this spawn (skip = inherit)
+  "max_attempts": 3                  // optional; retry ceiling for this row, default 1
 }
 ```
 
 The only hard requirements: `id` is present and non-empty; `argv` is a
 non-empty list. Everything else is optional.
+
+**Per-job knobs.** `nice` and `max_attempts` live on the JSONL row, not
+on the CLI — the mental model is that you're launching from your
+active shell, so process-wide globals don't fit. If `nice` is set, the
+runner calls `setpriority(PRIO_PROCESS, pid, nice)` on the spawned
+child; if absent, no call (inherit parent priority). Zero is a valid
+explicit `nice` (POSIX default), so encode "don't renice" as omitting
+the field, not as `"nice": 0`. `max_attempts` defaults to `1` — i.e.
+failure is final unless the row asks for retries.
 
 **Id convention.** Any unique string works. For multi-phase pipelines, the
 recommended shape is `<entity>:<phase>` (or `<entity>:<phase>:<sub>`):
@@ -191,7 +207,9 @@ contract — every other design decision falls out of it.
 Concretely, xjobs will re-run the same `(cwd, argv, env)` from scratch
 when:
 
-- The previous attempt exited non-zero and `attempts < --max-attempts`.
+- The previous attempt exited non-zero and the row's `attempts <
+  max_attempts` (default `max_attempts=1`; opt in to retries by
+  setting it explicitly on the JSONL line).
 - The previous attempt's runner crashed mid-flight (the row's `running`
   flock was released without a terminal write); the reaper resets the row
   to `pending` on the next drain.
@@ -229,10 +247,11 @@ the discipline lives in the child.
 | killed by signal   | `failed` (`signal=SIGKILL` etc) | `error` w/ signal |
 | spawn / setup fail | `failed` (`error=...`)          | `error` w/ msg  |
 
-Failed rows with `attempts < --max-attempts` re-queue automatically. Once
-out of retries they remain `failed` and stop the bare `xjobs` invocation
-from exiting `0`. To re-run them later: bump `--max-attempts` and run
-`xjobs` again (currently no `xjobs retry` verb — coming).
+Failed rows with `attempts < max_attempts` (the row's own column)
+re-queue automatically. Once out of retries they remain `failed` and
+stop the bare `xjobs` invocation from exiting `0`. To re-run them
+later: bump the row's `max_attempts` in SQL, or delete and re-pump
+(currently no `xjobs retry` verb — coming).
 
 ### Observing a job's output
 
@@ -385,7 +404,7 @@ Early MVP. Working:
 - Worker pool, per-job process spawn, `XJOBS` env injection, exit-code /
   signal capture (symbolic name via `unix.SignalName`).
 - Flock-based reaper at drain start.
-- Retry on failure up to `--max-attempts`.
+- Retry on failure up to the row's per-job `max_attempts` (default 1).
 - `running` / `success` / `error` events on stdout and in the `events`
   table.
 - Verbs: bare / `run` / `resume` / `ls` / `monitor`.

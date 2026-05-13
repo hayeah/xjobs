@@ -9,11 +9,12 @@ import (
 
 // jobRow is the subset of the jobs row needed to spawn an attempt.
 type jobRow struct {
-	ID       string
-	CWD      string
-	Argv     []string
-	Env      map[string]string
-	Attempt  int // post-claim attempts value
+	ID      string
+	CWD     string
+	Argv    []string
+	Env     map[string]string
+	Nice    *int // nil = inherit parent priority (skip setpriority)
+	Attempt int  // post-claim attempts value
 }
 
 // feedQueue iterates the work-queue in passes and emits unclaimed rows.
@@ -107,12 +108,12 @@ func (rn *Runner) runningCount(ctx context.Context) (int, error) {
 
 func (rn *Runner) fetchBatch(ctx context.Context, opts Options, seen map[string]int64) ([]jobRow, error) {
 	q := fmt.Sprintf(
-		`SELECT job_id, cwd, argv, env, attempts
+		`SELECT job_id, cwd, argv, env, attempts, nice
 		   FROM jobs
-		  WHERE (status='pending' OR (status='failed' AND attempts < %d))
+		  WHERE (status='pending' OR (status='failed' AND attempts < max_attempts))
 		    %s
 		  ORDER BY attempts, id`,
-		opts.MaxAttempts, whereAnd(opts.Where),
+		whereAnd(opts.Where),
 	)
 	rows, err := rn.db.QueryContext(ctx, q)
 	if err != nil {
@@ -125,8 +126,9 @@ func (rn *Runner) fetchBatch(ctx context.Context, opts Options, seen map[string]
 		var (
 			id, cwd, argvJSON, envJSON string
 			attempts                   int64
+			nice                       sql.NullInt64
 		)
-		if err := rows.Scan(&id, &cwd, &argvJSON, &envJSON, &attempts); err != nil {
+		if err := rows.Scan(&id, &cwd, &argvJSON, &envJSON, &attempts, &nice); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		if prev, ok := seen[id]; ok && attempts <= prev {
@@ -143,11 +145,17 @@ func (rn *Runner) fetchBatch(ctx context.Context, opts Options, seen map[string]
 				return nil, fmt.Errorf("decode env for id=%q: %w", id, err)
 			}
 		}
+		var niceP *int
+		if nice.Valid {
+			n := int(nice.Int64)
+			niceP = &n
+		}
 		batch = append(batch, jobRow{
 			ID:      id,
 			CWD:     cwd,
 			Argv:    argv,
 			Env:     env,
+			Nice:    niceP,
 			Attempt: int(attempts), // pre-claim; claim() will bump
 		})
 	}
@@ -163,24 +171,21 @@ func whereAnd(extra string) string {
 
 // claim flips an eligible row to 'running' and bumps attempts. Returns
 // (claimed, newAttempts).
-func (rn *Runner) claim(ctx context.Context, id string, opts Options) (bool, int, error) {
+func (rn *Runner) claim(ctx context.Context, id string) (bool, int, error) {
 	rn.writeMu.Lock()
 	defer rn.writeMu.Unlock()
 
-	q := fmt.Sprintf(
-		`UPDATE jobs
-		    SET status     = 'running',
-		        attempts   = attempts + 1,
-		        started_at = CURRENT_TIMESTAMP,
-		        ended_at   = NULL,
-		        pid        = NULL,
-		        exit_code  = NULL,
-		        signal     = NULL,
-		        error      = NULL
-		  WHERE job_id = ?
-		    AND (status = 'pending' OR (status = 'failed' AND attempts < %d))`,
-		opts.MaxAttempts,
-	)
+	q := `UPDATE jobs
+	         SET status     = 'running',
+	             attempts   = attempts + 1,
+	             started_at = CURRENT_TIMESTAMP,
+	             ended_at   = NULL,
+	             pid        = NULL,
+	             exit_code  = NULL,
+	             signal     = NULL,
+	             error      = NULL
+	       WHERE job_id = ?
+	         AND (status = 'pending' OR (status = 'failed' AND attempts < max_attempts))`
 	res, err := rn.db.ExecContext(ctx, q, id)
 	if err != nil {
 		return false, 0, fmt.Errorf("claim id=%q: %w", id, err)

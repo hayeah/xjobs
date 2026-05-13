@@ -20,13 +20,16 @@ import (
 )
 
 // Options tune one Run.
+//
+// Per-job knobs (nice, max_attempts) live on the JSONL row, not here —
+// the runner's mental model is "launching from the current active
+// shell," so process-wide priority/retry globals don't belong on the
+// runner. See Job in job.go.
 type Options struct {
-	StateDir    string        // default ".xjobs"
-	Workers     int           // default runtime.NumCPU()
-	MaxAttempts int           // default 1 (no auto-retry)
-	Nice        int           // default 5
-	Where       string        // optional SQL fragment AND-combined with the work-queue predicate
-	PollEvery   time.Duration // how often feedQueue re-scans when idle (default 250ms)
+	StateDir  string        // default ".xjobs"
+	Workers   int           // default runtime.NumCPU()
+	Where     string        // optional SQL fragment AND-combined with the work-queue predicate
+	PollEvery time.Duration // how often feedQueue re-scans when idle (default 250ms)
 }
 
 func (o Options) withDefaults() Options {
@@ -35,9 +38,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Workers <= 0 {
 		o.Workers = runtime.NumCPU()
-	}
-	if o.MaxAttempts <= 0 {
-		o.MaxAttempts = 1
 	}
 	if o.PollEvery <= 0 {
 		o.PollEvery = 250 * time.Millisecond
@@ -134,7 +134,7 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 		go func() {
 			defer wg.Done()
 			for row := range queue {
-				if err := rn.runOne(ctx, opts, row, sink); err != nil {
+				if err := rn.runOne(ctx, row, sink); err != nil {
 					recordErr(err)
 				}
 			}
@@ -158,8 +158,8 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 }
 
 // runOne claims, executes, and terminal-writes a single row.
-func (rn *Runner) runOne(ctx context.Context, opts Options, row jobRow, sink *eventSink) error {
-	claimed, attempt, err := rn.claim(ctx, row.ID, opts)
+func (rn *Runner) runOne(ctx context.Context, row jobRow, sink *eventSink) error {
+	claimed, attempt, err := rn.claim(ctx, row.ID)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func (rn *Runner) runOne(ctx context.Context, opts Options, row jobRow, sink *ev
 		})
 	}
 
-	res := execAttempt(ctx, rn.stateDir, row, rn.dbPath, opts.Nice, onSpawn)
+	res := execAttempt(ctx, rn.stateDir, row, rn.dbPath, onSpawn)
 	dur := time.Since(start)
 
 	switch {

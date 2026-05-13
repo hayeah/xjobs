@@ -30,7 +30,7 @@ func newRunnerForTest(t *testing.T) *Runner {
 
 func fetchBatchIDs(t *testing.T, rn *Runner) []string {
 	t.Helper()
-	rows, err := rn.fetchBatch(context.Background(), Options{MaxAttempts: 3}, map[string]int64{})
+	rows, err := rn.fetchBatch(context.Background(), Options{}, map[string]int64{})
 	if err != nil {
 		t.Fatalf("fetchBatch: %v", err)
 	}
@@ -185,9 +185,13 @@ func TestJobsSchemaShape(t *testing.T) {
 // failed, leaving attempts at the post-claim value). Mirrors what
 // runOne does on a non-zero exit, but without spawning a child — lets
 // us test work-queue ordering in isolation.
-func simulateAttempt(t *testing.T, rn *Runner, id string, maxAttempts int) {
+//
+// Eligibility now lives on the row's own max_attempts column; the test
+// plans encode "max_attempts":3 inline so multiple failed attempts
+// remain re-claimable.
+func simulateAttempt(t *testing.T, rn *Runner, id string) {
 	t.Helper()
-	claimed, _, err := rn.claim(context.Background(), id, Options{MaxAttempts: maxAttempts})
+	claimed, _, err := rn.claim(context.Background(), id)
 	if err != nil {
 		t.Fatalf("claim %q: %v", id, err)
 	}
@@ -206,16 +210,16 @@ func simulateAttempt(t *testing.T, rn *Runner, id string, maxAttempts int) {
 // `ORDER BY attempts, id` ranks them first regardless of insertion id.
 func TestRetryRoundRobin_OneFailureYieldsToSiblings(t *testing.T) {
 	rn := newRunnerForTest(t)
-	plan := `{"id":"A","argv":["/usr/bin/false"]}
-{"id":"B","argv":["/usr/bin/false"]}
-{"id":"C","argv":["/usr/bin/false"]}
+	plan := `{"id":"A","argv":["/usr/bin/false"],"max_attempts":3}
+{"id":"B","argv":["/usr/bin/false"],"max_attempts":3}
+{"id":"C","argv":["/usr/bin/false"],"max_attempts":3}
 `
 	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(plan)); err != nil {
 		t.Fatalf("Pump: %v", err)
 	}
 
 	// A is the lowest-id row (1). Simulate one failed attempt on A.
-	simulateAttempt(t, rn, "A", 3)
+	simulateAttempt(t, rn, "A")
 
 	// With the old `ORDER BY id` the order would be [A, B, C] — A's
 	// id=1 wins. With `ORDER BY attempts, id`, A's attempts=1 is
@@ -233,9 +237,9 @@ func TestRetryRoundRobin_OneFailureYieldsToSiblings(t *testing.T) {
 // now-at-attempts=2 row.
 func TestRetryRoundRobin_AllFailedSiblingsRotateByAttempts(t *testing.T) {
 	rn := newRunnerForTest(t)
-	plan := `{"id":"A","argv":["/usr/bin/false"]}
-{"id":"B","argv":["/usr/bin/false"]}
-{"id":"C","argv":["/usr/bin/false"]}
+	plan := `{"id":"A","argv":["/usr/bin/false"],"max_attempts":3}
+{"id":"B","argv":["/usr/bin/false"],"max_attempts":3}
+{"id":"C","argv":["/usr/bin/false"],"max_attempts":3}
 `
 	if _, _, _, err := rn.Pump(context.Background(), strings.NewReader(plan)); err != nil {
 		t.Fatalf("Pump: %v", err)
@@ -243,7 +247,7 @@ func TestRetryRoundRobin_AllFailedSiblingsRotateByAttempts(t *testing.T) {
 
 	// Fail every row at attempt 1 — all three end with attempts=1.
 	for _, id := range []string{"A", "B", "C"} {
-		simulateAttempt(t, rn, id, 3)
+		simulateAttempt(t, rn, id)
 	}
 
 	// All tied at attempts=1 — id is the tiebreaker, so insertion
@@ -253,7 +257,7 @@ func TestRetryRoundRobin_AllFailedSiblingsRotateByAttempts(t *testing.T) {
 	}
 
 	// Fail A again — A's attempts goes to 2. B and C still at 1.
-	simulateAttempt(t, rn, "A", 3)
+	simulateAttempt(t, rn, "A")
 
 	// Order should rotate: B and C come before A's third try.
 	got := fetchBatchIDs(t, rn)

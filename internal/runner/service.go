@@ -36,7 +36,7 @@ type runResult struct {
 // The flock is the liveness signal the reaper probes — held while the
 // child is alive, released on this function's return (success, failure,
 // or panic via defer).
-func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string, niceN int, onSpawn func(pid int)) runResult {
+func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string, onSpawn func(pid int)) runResult {
 	jobDir := filepath.Join(stateDir, row.ID)
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return runResult{Err: fmt.Errorf("mkdir %s: %w", jobDir, err)}
@@ -78,9 +78,11 @@ func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string
 
 	res := runResult{PID: cmd.Process.Pid}
 
-	// Apply nice if requested. Best-effort; ignore failures.
-	if niceN > 0 {
-		_ = setpriority(cmd.Process.Pid, niceN)
+	// Per-job nice. Absent (nil) means inherit parent priority — no
+	// setpriority call. Zero is a valid explicit value (POSIX default).
+	// Best-effort; ignore failures.
+	if row.Nice != nil {
+		_ = setpriority(cmd.Process.Pid, *row.Nice)
 	}
 
 	if onSpawn != nil {
