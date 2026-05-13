@@ -107,11 +107,11 @@ func (rn *Runner) runningCount(ctx context.Context) (int, error) {
 
 func (rn *Runner) fetchBatch(ctx context.Context, opts Options, seen map[string]int64) ([]jobRow, error) {
 	q := fmt.Sprintf(
-		`SELECT id, cwd, argv, env, attempts
+		`SELECT job_id, cwd, argv, env, attempts
 		   FROM jobs
 		  WHERE (status='pending' OR (status='failed' AND attempts < %d))
 		    %s
-		  ORDER BY n`,
+		  ORDER BY id`,
 		opts.MaxAttempts, whereAnd(opts.Where),
 	)
 	rows, err := rn.db.QueryContext(ctx, q)
@@ -177,7 +177,7 @@ func (rn *Runner) claim(ctx context.Context, id string, opts Options) (bool, int
 		        exit_code  = NULL,
 		        signal     = NULL,
 		        error      = NULL
-		  WHERE id = ?
+		  WHERE job_id = ?
 		    AND (status = 'pending' OR (status = 'failed' AND attempts < %d))`,
 		opts.MaxAttempts,
 	)
@@ -190,7 +190,7 @@ func (rn *Runner) claim(ctx context.Context, id string, opts Options) (bool, int
 		return false, 0, nil
 	}
 	var attempts int
-	if err := rn.db.QueryRowContext(ctx, `SELECT attempts FROM jobs WHERE id = ?`, id).Scan(&attempts); err != nil {
+	if err := rn.db.QueryRowContext(ctx, `SELECT attempts FROM jobs WHERE job_id = ?`, id).Scan(&attempts); err != nil {
 		return true, 0, fmt.Errorf("read attempts id=%q: %w", id, err)
 	}
 	return true, attempts, nil
@@ -200,7 +200,7 @@ func (rn *Runner) claim(ctx context.Context, id string, opts Options) (bool, int
 func (rn *Runner) setPID(ctx context.Context, id string, pid int) error {
 	rn.writeMu.Lock()
 	defer rn.writeMu.Unlock()
-	_, err := rn.db.ExecContext(ctx, `UPDATE jobs SET pid = ? WHERE id = ?`, pid, id)
+	_, err := rn.db.ExecContext(ctx, `UPDATE jobs SET pid = ? WHERE job_id = ?`, pid, id)
 	return err
 }
 
@@ -209,7 +209,7 @@ func (rn *Runner) terminalOK(ctx context.Context, id string, exitCode int) error
 	rn.writeMu.Lock()
 	defer rn.writeMu.Unlock()
 	_, err := rn.db.ExecContext(ctx,
-		`UPDATE jobs SET status='done', ended_at=CURRENT_TIMESTAMP, exit_code=?, signal=NULL, error=NULL WHERE id=?`,
+		`UPDATE jobs SET status='done', ended_at=CURRENT_TIMESTAMP, exit_code=?, signal=NULL, error=NULL WHERE job_id=?`,
 		exitCode, id)
 	return err
 }
@@ -219,7 +219,7 @@ func (rn *Runner) terminalFail(ctx context.Context, id string, exitCode sql.Null
 	rn.writeMu.Lock()
 	defer rn.writeMu.Unlock()
 	_, err := rn.db.ExecContext(ctx,
-		`UPDATE jobs SET status='failed', ended_at=CURRENT_TIMESTAMP, exit_code=?, signal=?, error=? WHERE id=?`,
+		`UPDATE jobs SET status='failed', ended_at=CURRENT_TIMESTAMP, exit_code=?, signal=?, error=? WHERE job_id=?`,
 		exitCode, nullStr(sig), errMsg, id)
 	return err
 }

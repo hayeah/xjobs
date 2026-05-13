@@ -51,7 +51,8 @@ func (s *eventSink) emit(ctx context.Context, ev Event) error {
 
 	s.rn.writeMu.Lock()
 	_, err = s.rn.db.ExecContext(ctx,
-		`INSERT INTO events(ts, job_id, attempt, kind, data) VALUES(?, ?, ?, ?, ?)`,
+		`INSERT INTO events(ts, job_id, attempt, kind, data)
+		 VALUES(?, (SELECT id FROM jobs WHERE job_id = ?), ?, ?, ?)`,
 		ev.TS, ev.ID, ev.Attempt, ev.Kind, string(data),
 	)
 	s.rn.writeMu.Unlock()
