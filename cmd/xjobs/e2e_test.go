@@ -220,6 +220,50 @@ func TestE2EProcessGroupCleanupOnSIGINT(t *testing.T) {
 	waitForDeadProcess(t, pid)
 }
 
+func TestE2EPumpIfUpDrainerLockHeldExitsOne(t *testing.T) {
+	state := stateDir(t)
+	first, firstOut, firstErr := startBackgroundDrainer(t, state,
+		jobJSONL(t, "slow", []string{"/bin/sleep", "2"}, 0))
+	defer killBackgroundDrainer(t, first)
+	waitForLine(t, firstOut, `"kind":"running"`)
+
+	jobsFile := writeJobsFile(t, jobJSONL(t, "newrow", []string{"/usr/bin/true"}, 0))
+	_, stderr, err := runXJobs(t, state, "", jobsFile)
+	if code := exitCode(err); code != 1 {
+		t.Fatalf("second xjobs exit: got %d, want 1, stderr=%s err=%v firstErr=%s", code, stderr, err, firstErr.String())
+	}
+	if !strings.Contains(stderr, "runner.lock held by pid") {
+		t.Fatalf("second xjobs stderr missing lock-held line:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "pumped 1") {
+		t.Fatalf("second xjobs stderr missing pumped count:\n%s", stderr)
+	}
+	if got := jobStatus(t, state, "newrow"); got == "" {
+		t.Fatalf("newrow not in DB after second xjobs (it should have been pumped)")
+	}
+}
+
+func TestE2EPumpIfUpDrainerLockHeldDrainsThroughLiveRunner(t *testing.T) {
+	state := stateDir(t)
+	first, firstOut, firstErr := startBackgroundDrainer(t, state,
+		jobJSONL(t, "slow", []string{"/bin/sleep", "3"}, 0))
+	defer killBackgroundDrainer(t, first)
+	waitForLine(t, firstOut, `"kind":"running"`)
+
+	jobsFile := writeJobsFile(t, jobJSONL(t, "newrow", []string{"/usr/bin/true"}, 0))
+	_, stderr, err := runXJobs(t, state, "", "--pump-if-up", jobsFile)
+	if code := exitCode(err); code != 0 {
+		t.Fatalf("second xjobs --pump-if-up exit: got %d, want 0, stderr=%s err=%v firstErr=%s", code, stderr, err, firstErr.String())
+	}
+	if !strings.Contains(stderr, "runner.lock held by pid") {
+		t.Fatalf("second xjobs --pump-if-up stderr missing lock-held line:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "pumped 1") {
+		t.Fatalf("second xjobs --pump-if-up stderr missing pumped count:\n%s", stderr)
+	}
+	waitForJobStatus(t, state, "newrow", "done", 5*time.Second)
+}
+
 func TestE2ELSAndMonitorVerbs(t *testing.T) {
 	state := stateDir(t)
 	_, stderr, err := runXJobs(t, state, jobJSONL(t, "inspect", []string{"/usr/bin/true"}, 0))
@@ -462,4 +506,76 @@ func processAlive(pid int) bool {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// startBackgroundDrainer launches an xjobs run that pumps stdin and
+// stays alive draining jobs. Returns the *exec.Cmd, a piped stdout
+// reader (for waitForLine), and a stderr buffer (for diagnostics).
+// Caller MUST defer killBackgroundDrainer to tear it down.
+func startBackgroundDrainer(t *testing.T, state, stdin string) (*exec.Cmd, io.Reader, *bytes.Buffer) {
+	t.Helper()
+	cmd := xjobsCommand(state)
+	cmd.Stdin = strings.NewReader(stdin)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start background xjobs: %v", err)
+	}
+	return cmd, stdout, stderr
+}
+
+func killBackgroundDrainer(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+	}
+}
+
+func writeJobsFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "jobs.jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write jobs file: %v", err)
+	}
+	return path
+}
+
+func jobStatus(t *testing.T, state, id string) string {
+	t.Helper()
+	db := openTestDB(t, state)
+	defer db.Close()
+	var status string
+	err := db.QueryRow(`SELECT status FROM jobs WHERE job_id = ?`, id).Scan(&status)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read job %q status: %v", id, err)
+	}
+	return status
+}
+
+func waitForJobStatus(t *testing.T, state, id, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := jobStatus(t, state, id); got == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for job %q to reach status %q (last seen: %q)", id, want, jobStatus(t, state, id))
 }
