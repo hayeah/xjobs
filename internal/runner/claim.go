@@ -111,7 +111,7 @@ func (rn *Runner) fetchBatch(ctx context.Context, opts Options, seen map[string]
 		   FROM jobs
 		  WHERE (status='pending' OR (status='failed' AND attempts < %d))
 		    %s
-		  ORDER BY id`,
+		  ORDER BY seq`,
 		opts.MaxAttempts, whereAnd(opts.Where),
 	)
 	rows, err := rn.db.QueryContext(ctx, q)

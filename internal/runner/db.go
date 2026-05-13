@@ -25,6 +25,7 @@ func ensureSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
 			id          TEXT PRIMARY KEY,
+			seq         INTEGER NOT NULL DEFAULT 0,
 			cwd         TEXT NOT NULL,
 			argv        TEXT NOT NULL,
 			env         TEXT NOT NULL DEFAULT '{}',
@@ -54,6 +55,34 @@ func ensureSchema(db *sql.DB) error {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("ensure schema: %w", err)
 		}
+	}
+	if err := migrateAddJobsSeq(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateAddJobsSeq adds jobs.seq + idx_jobs_seq for pre-seq databases.
+// On a fresh DB the column is already there from CREATE TABLE; the ALTER
+// is skipped via the pragma_table_info probe. On an old DB the column is
+// added with DEFAULT 0 and backfilled from rowid (preserves the original
+// insertion order, since SQLite rowids on a TEXT-PK table grow monotonically
+// with insert order absent VACUUM).
+func migrateAddJobsSeq(db *sql.DB) error {
+	var hasSeq int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='seq'`).Scan(&hasSeq); err != nil {
+		return fmt.Errorf("probe jobs.seq: %w", err)
+	}
+	if hasSeq == 0 {
+		if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add jobs.seq: %w", err)
+		}
+		if _, err := db.Exec(`UPDATE jobs SET seq = rowid WHERE seq = 0`); err != nil {
+			return fmt.Errorf("backfill jobs.seq: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_seq ON jobs(seq)`); err != nil {
+		return fmt.Errorf("create idx_jobs_seq: %w", err)
 	}
 	return nil
 }

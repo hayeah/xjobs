@@ -143,6 +143,7 @@ caller data goes in `meta`.
 ```sql
 CREATE TABLE jobs (
     id          TEXT PRIMARY KEY,
+    seq         INTEGER NOT NULL DEFAULT 0,             -- insertion order; assigned by Pump
     cwd         TEXT NOT NULL,
     argv        TEXT NOT NULL,                          -- JSON array
     env         TEXT NOT NULL DEFAULT '{}',             -- JSON object
@@ -158,12 +159,19 @@ CREATE TABLE jobs (
     meta        TEXT NOT NULL DEFAULT '{}'              -- JSON; caller scratch
 );
 CREATE INDEX idx_jobs_status ON jobs(status);
+CREATE INDEX idx_jobs_seq    ON jobs(seq);
 ```
 
-State-column names (`status`, `attempts`, `pid`, `exit_code`, `signal`,
-`session_key`, `started_at`, `ended_at`, `error`, `meta`) are reserved —
-the JSONL line cannot use them as top-level fields. The runner stores
-the caller's free-form data only in `meta`.
+State-column names (`seq`, `status`, `attempts`, `pid`, `exit_code`,
+`signal`, `session_key`, `started_at`, `ended_at`, `error`, `meta`) are
+reserved — the JSONL line cannot use them as top-level fields. The runner
+stores the caller's free-form data only in `meta`.
+
+`seq` is assigned by `Pump` at INSERT time via `(SELECT COALESCE(MAX(seq),
+0) + 1 FROM jobs)` — single-writer under `writeMu`, so no race. It is the
+work-queue's `ORDER BY` so jobs drain in JSONL insertion order rather than
+alphabetical id order. Existing pre-`seq` databases are migrated in-place
+on open (ALTER + backfill from `rowid`).
 
 ### Work-queue predicate
 
