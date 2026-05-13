@@ -105,7 +105,7 @@ done`. `--json` emits JSONL of the row with parsed argv — pipe through
 
 `xjobs monitor` prints the most recent event line, then blocks until the
 next event lands, then exits. Agents poll it in a loop to wait for "the
-next interesting thing." `--id <prefix>` filters to one job.
+next interesting thing." `--id ID` filters to one exact job id.
 
 ### Exit codes
 
@@ -135,8 +135,9 @@ is in, what it does, or how long it takes — only its exit code.
 }
 ```
 
-The only hard requirements: `id` is present and non-empty; `argv` is a
-non-empty list. Everything else is optional.
+The only hard requirements: `id` is present, non-empty, and not a path
+(`.` / `..` / slash, backslash, NUL, and control characters are
+rejected); `argv` is a non-empty list. Everything else is optional.
 
 **Per-job knobs.** `nice` and `max_attempts` live on the JSONL row, not
 on the CLI — the mental model is that you're launching from your
@@ -257,7 +258,8 @@ later: bump the row's `max_attempts` in SQL, or delete and re-pump
 
 Each child's combined stdout + stderr is captured through plain pipes
 to `.xjobs/<id>/output.log`. Tail it with `tail -f`, grep it, hand it
-to downstream tooling — it's a plain text file.
+to downstream tooling — it's a plain text file. Retries append to the
+same file with attempt separators so earlier failure output is not lost.
 
 ```sh
 tail -f .xjobs/tt0133093:download/output.log
@@ -381,7 +383,7 @@ sqlite3 .xjobs/db.sql3 'SELECT COUNT(*), AVG(result_n) FROM results;'
 ├── db.sql3-shm
 └── <job-id>/            # one dir per attempted job
     ├── lock             # exclusive flock held for the child's lifetime
-    └── output.log       # captured stdout + stderr from the child
+    └── output.log       # captured stdout + stderr, appended across attempts
 ```
 
 Default state dir is `./.xjobs/`. Override with `--state-dir <path>`.

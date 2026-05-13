@@ -61,7 +61,7 @@ directory into a set of attachable terminal sessions — parked at
 ├── db.sql3-shm
 └── <job-id>/
     ├── lock             # exclusive flock held for the child's lifetime
-    └── output.log       # captured stdout + stderr from the child
+    └── output.log       # captured stdout + stderr, appended across attempts
 ```
 
 Default state dir is `./.xjobs/` (CWD-relative). Override with
@@ -70,11 +70,12 @@ queues — the natural extension of "every directory is its own scratch
 workspace."
 
 Each child is spawned through plain `os.exec` pipes; its combined
-stdout + stderr is written to `<job-id>/output.log`. This is enough for
-line-oriented children but degrades on TUI children (escape codes pile
-up as raw bytes). A deferred libghostty PTY integration would replace
-`output.log` with a binary frame stream (`pty.hootty.log`) plus live
-attach / replay verbs — see
+stdout + stderr is written to `<job-id>/output.log`. Retries append to
+the same file with attempt separators so earlier failed-attempt evidence
+is retained. This is enough for line-oriented children but degrades on
+TUI children (escape codes pile up as raw bytes). A deferred libghostty
+PTY integration would replace `output.log` with a binary frame stream
+(`pty.hootty.log`) plus live attach / replay verbs — see
 [`docs/future/hootty-integration.md`](docs/future/hootty-integration.md).
 The swap point is `execAttempt` in `internal/runner/service.go`.
 
@@ -97,11 +98,12 @@ JSONL on stdin or in a file. One line per job:
 }
 ```
 
-Hard requirements: `id` is present and non-empty; `argv` is a non-empty
-list. Pumps `INSERT OR IGNORE` on `id`, so re-pumping a known id is a
-no-op (not a re-queue). To force a retry of a `failed` row past its
-own `max_attempts`, delete the row and re-pump it (the dedicated
-`retry` verb is future work).
+Hard requirements: `id` is present, non-empty, and not a path (`.` /
+`..` / slash, backslash, NUL, and control characters are rejected);
+`argv` is a non-empty list. Pumps `INSERT OR IGNORE` on `id`, so
+re-pumping a known id is a no-op (not a re-queue). To force a retry of
+a `failed` row past its own `max_attempts`, delete the row and re-pump
+it (the dedicated `retry` verb is future work).
 
 ### Per-job knobs
 
@@ -378,7 +380,8 @@ orthogonal question: what's happening *inside* a running job, right now?
 
 Today the answer is "tail the log file." Each child is spawned through
 plain pipes and its combined stdout + stderr is written to
-`.xjobs/<id>/output.log`:
+`.xjobs/<id>/output.log`, appending one separator-delimited section per
+attempt:
 
 ```sh
 tail -f .xjobs/tt0133093:download/output.log

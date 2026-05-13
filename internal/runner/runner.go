@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -116,6 +117,7 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 	queue := make(chan jobRow, opts.Workers*2)
 	var wg sync.WaitGroup
 	wg.Add(opts.Workers)
+	var inflight atomic.Int64
 
 	var firstErr error
 	var firstErrMu sync.Mutex
@@ -134,9 +136,12 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 		go func() {
 			defer wg.Done()
 			for row := range queue {
-				if err := rn.runOne(ctx, row, sink); err != nil {
-					recordErr(err)
-				}
+				func() {
+					defer inflight.Add(-1)
+					if err := rn.runOne(ctx, row, sink); err != nil {
+						recordErr(err)
+					}
+				}()
 			}
 		}()
 	}
@@ -147,14 +152,37 @@ func (rn *Runner) Drain(ctx context.Context, opts Options, pumpDone <-chan struc
 		close(closed)
 		idleSignal = closed
 	}
-	feedErr := rn.feedQueue(ctx, opts, queue, idleSignal)
+	feedErr := rn.feedQueue(ctx, opts, queue, idleSignal, &inflight)
 	close(queue)
 	wg.Wait()
 
 	if feedErr != nil && !errors.Is(feedErr, context.Canceled) {
 		return feedErr
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	failed, err := rn.terminalFailedCount(ctx, opts.Where)
+	if err != nil {
+		return err
+	}
+	if failed > 0 {
+		return FailedJobsError{Count: failed}
+	}
 	return firstErr
+}
+
+// FailedJobsError reports that drain reached quiescence with terminal
+// failed rows still present.
+type FailedJobsError struct {
+	Count int
+}
+
+func (e FailedJobsError) Error() string {
+	if e.Count == 1 {
+		return "1 job failed"
+	}
+	return fmt.Sprintf("%d jobs failed", e.Count)
 }
 
 // runOne claims, executes, and terminal-writes a single row.
@@ -173,36 +201,46 @@ func (rn *Runner) runOne(ctx context.Context, row jobRow, sink *eventSink) error
 		// Best-effort: record PID and emit "running". A failure to insert
 		// the event is logged-not-fatal — the terminal write is what the
 		// row state depends on.
-		_ = rn.setPID(ctx, row.ID, pid)
-		_ = sink.emit(ctx, Event{
+		if err := rn.setPID(ctx, row.ID, pid); err != nil {
+			fmt.Fprintf(os.Stderr, "xjobs: set pid id=%q: %v\n", row.ID, err)
+		}
+		if err := sink.emit(ctx, Event{
 			Kind:    "running",
 			ID:      row.ID,
 			Attempt: attempt,
 			PID:     pid,
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "xjobs: emit running id=%q: %v\n", row.ID, err)
+		}
 	}
 
 	res := execAttempt(ctx, rn.stateDir, row, rn.dbPath, onSpawn)
 	dur := time.Since(start)
+	finalCtx := ctx
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		finalCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
 
 	switch {
 	case res.Err != nil:
-		if termErr := rn.terminalFail(ctx, row.ID, sql.NullInt64{}, "", res.Err.Error()); termErr != nil {
+		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{}, "", res.Err.Error()); termErr != nil {
 			return termErr
 		}
 	case res.Signal != "":
-		if termErr := rn.terminalFail(ctx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, res.Signal, "killed by "+res.Signal); termErr != nil {
+		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, res.Signal, "killed by "+res.Signal); termErr != nil {
 			return termErr
 		}
 	case res.ExitCode == 0:
-		if termErr := rn.terminalOK(ctx, row.ID, 0); termErr != nil {
+		if termErr := rn.terminalOK(finalCtx, row.ID, 0); termErr != nil {
 			return termErr
 		}
 	default:
-		if termErr := rn.terminalFail(ctx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, "", fmt.Sprintf("exit %d", res.ExitCode)); termErr != nil {
+		if termErr := rn.terminalFail(finalCtx, row.ID, sql.NullInt64{Int64: int64(res.ExitCode), Valid: true}, "", fmt.Sprintf("exit %d", res.ExitCode)); termErr != nil {
 			return termErr
 		}
 	}
 
-	return sink.emit(ctx, eventFromResult(row.ID, attempt, dur, res))
+	return sink.emit(finalCtx, eventFromResult(row.ID, attempt, dur, res))
 }
