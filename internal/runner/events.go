@@ -13,10 +13,11 @@ import (
 // Mirrors a row in the events table.
 type Event struct {
 	TS      string `json:"ts"`
-	Kind    string `json:"kind"`            // "success" | "error"
+	Kind    string `json:"kind"` // "running" | "success" | "error"
 	ID      string `json:"id"`
 	Attempt int    `json:"attempt"`
-	DurMS   int64  `json:"dur_ms"`
+	PID     int    `json:"pid,omitempty"`
+	DurMS   int64  `json:"dur_ms,omitempty"`
 	Exit    *int   `json:"exit,omitempty"`
 	Signal  string `json:"signal,omitempty"`
 	Error   string `json:"error,omitempty"`

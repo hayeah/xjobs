@@ -169,10 +169,20 @@ func (rn *Runner) runOne(ctx context.Context, opts Options, row jobRow, sink *ev
 	row.Attempt = attempt
 
 	start := time.Now()
-	res := execAttempt(ctx, rn.stateDir, row, rn.dbPath, opts.Nice)
-	if res.PID != 0 {
-		_ = rn.setPID(ctx, row.ID, res.PID)
+	onSpawn := func(pid int) {
+		// Best-effort: record PID and emit "running". A failure to insert
+		// the event is logged-not-fatal — the terminal write is what the
+		// row state depends on.
+		_ = rn.setPID(ctx, row.ID, pid)
+		_ = sink.emit(ctx, Event{
+			Kind:    "running",
+			ID:      row.ID,
+			Attempt: attempt,
+			PID:     pid,
+		})
 	}
+
+	res := execAttempt(ctx, rn.stateDir, row, rn.dbPath, opts.Nice, onSpawn)
 	dur := time.Since(start)
 
 	switch {

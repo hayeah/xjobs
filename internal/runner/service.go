@@ -29,10 +29,14 @@ type runResult struct {
 //  4. spawns the child with that env / cwd / stdio,
 //  5. waits and returns the exit info.
 //
+// onSpawn, if non-nil, is called once after a successful cmd.Start() with
+// the freshly spawned PID. Setup errors prior to spawn (mkdir, flock, log
+// open) do not invoke it.
+//
 // The flock is the liveness signal the reaper probes — held while the
 // child is alive, released on this function's return (success, failure,
 // or panic via defer).
-func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string, niceN int) runResult {
+func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string, niceN int, onSpawn func(pid int)) runResult {
 	jobDir := filepath.Join(stateDir, row.ID)
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return runResult{Err: fmt.Errorf("mkdir %s: %w", jobDir, err)}
@@ -77,6 +81,10 @@ func execAttempt(ctx context.Context, stateDir string, row jobRow, dbPath string
 	// Apply nice if requested. Best-effort; ignore failures.
 	if niceN > 0 {
 		_ = setpriority(cmd.Process.Pid, niceN)
+	}
+
+	if onSpawn != nil {
+		onSpawn(res.PID)
 	}
 
 	waitErr := cmd.Wait()
